@@ -1,0 +1,2 @@
+# Optional QA-only dependency. Not required to run MovieVault.
+playwright>=1.48,<2

@@ -1,0 +1,4 @@
+# Installed only on the Windows build machine; runtime app bundles these libraries.
+Pillow>=10.4,<13
+pywebview>=5.3,<7
+pyinstaller>=6.9,<8

@@ -1,0 +1,19 @@
+MovieVault v2.0 RC1 — SOURCE PREVIEW / Arabic quick start
+
+DO NOT OVERWRITE MovieVault_v1! Keep its files and make a backup.
+
+1) Extract this v2 ZIP to a NEW separate folder.
+2) In CMD in that folder:
+   py -3.12 -m pip install -r requirements-windows.txt
+3) Copy trusted ffprobe.exe to vendor/; ffmpeg.exe is optional for Generate Custom Poster.
+4) Launch:
+   py -3.12 MovieVault.pyw
+   Browser diagnostic alternative: py -3.12 dev.py --browser
+5) First run: Settings > Import Previous Library > Auto-detect OR Choose Folder/Backup ZIP.
+6) Preview Data (shows movies, subtitles, IMDb index, posters) > Import Previewed Data > close and restart v2.
+   The old app folder may contain no DB: v1 user data usually sits under %LOCALAPPDATA%\MovieVault.
+   v2 stores its own independent data under %LOCALAPPDATA%\MovieVault\v2.
+7) Test one movie and subtitles before scanning your entire collection.
+
+For optional native Windows installer compilation: BUILD_WINDOWS.cmd (Windows, Python 3.12 x64, Inno Setup 6).
+IMPORTANT: Installer has not yet been tested on user's Windows. See README_AR.md and docs/QA_REPORT.md.
