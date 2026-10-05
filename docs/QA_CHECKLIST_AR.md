@@ -1,4 +1,4 @@
-# قبول MovieVault v2.0 RC1 على Windows — قبل الاعتماد
+# قبول MovieVault على Windows — قبل الاعتماد (الإصدار في `VERSION`)
 
 **تحذير:** هذه قائمة تنفيذ يدوية، ليست اختبارات نجحت تلقائيًا. نفّذها على بيانات تجريبية أو نسخة مستقلة مع Backup.
 
@@ -17,3 +17,6 @@
 - [ ] فصل الهارد الخارجي = Offline وليس حذف سجل الأفلام؛ حذف فيلم على هارد متصل بعد Scan = Missing مع بقاء الاسم الأصلي.
 - [ ] Settings → Diagnostic Center → Export ZIP. افتح الملف وتأكد أنه لا يحتوي على توكنات TMDb/Gemini ولا قاعدة SQLite الأصلية ولا مساراتك الحساسة.
 - [ ] اختبر Windows Portable ZIP وSetup.exe بعد بنائهما على Windows؛ نظافة التثبيت، الترقية من RC إلى إصدار تالٍ، الاحتفاظ بالبيانات بعد Uninstall، وعدم استبدال v1.
+- [ ] تحقق أن أسماء Portable ZIP وSetup.exe، والنسخة داخل الواجهة وخصائص EXE، كلها تطابق ملف `VERSION`، وأن `release-manifest.json` ينجح عند إعادة فحصه.
+- [ ] افحص `MovieVault.spdx.json` و`external-binaries.json` وتأكد من ظهور ffprobe/ffmpeg الصحيحين وبصمات SHA-256. لا توزع أي ملف مصدره غير موثوق.
+- [ ] للبناء الموقّع: تحقق من Authenticode والتوقيت على MovieVault.exe وSetup.exe. للبناء غير الموقّع: تأكد أن `release-metadata.json` يذكر `UNSIGNED` بوضوح.

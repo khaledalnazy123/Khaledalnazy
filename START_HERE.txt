@@ -1,4 +1,4 @@
-MovieVault v2.0 RC1 — SOURCE PREVIEW / Arabic quick start
+MovieVault source preview — the exact release version is in VERSION
 
 DO NOT OVERWRITE MovieVault_v1! Keep its files and make a backup.
 
@@ -15,5 +15,5 @@ DO NOT OVERWRITE MovieVault_v1! Keep its files and make a backup.
    v2 stores its own independent data under %LOCALAPPDATA%\MovieVault\v2.
 7) Test one movie and subtitles before scanning your entire collection.
 
-For optional native Windows installer compilation: BUILD_WINDOWS.cmd (Windows, Python 3.12 x64, Inno Setup 6).
+For a reproducible native Windows release build, use BUILD_WINDOWS.cmd (Windows, Python 3.12 x64, Inno Setup 6). The build uses the exact hashed lockfiles, not requirements-windows.txt.
 IMPORTANT: Installer has not yet been tested on user's Windows. See README_AR.md and docs/QA_REPORT.md.

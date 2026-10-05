@@ -1,14 +1,16 @@
 """Browser-only UI smoke using stubbed API, no user data and no network."""
-import json,re
+import json,re,sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 HERE=Path(__file__).parents[1]
-html=(HERE/'web/index.html').read_text().replace('{{APP_VERSION}}','2.0.0-rc.1').replace('{{APP_TOKEN}}','testing')
+sys.path.insert(0,str(HERE))
+from mv_version import VERSION
+html=(HERE/'web/index.html').read_text().replace('{{APP_VERSION}}',VERSION).replace('{{APP_TOKEN}}','testing')
 html=html.replace('<script src="/app.js"></script>','')
 html=re.sub(r'<link[^>]+/style.css[^>]*>','',html)
 movies=[dict(id=i+1,display_title=title,year=year,genres='Action, Drama',release_group='YTS',resolution_tag='1080p',resolution_verified=1,status='available',size_bytes=3_000_000,poster_path='',poster_locked=0,source='BluRay',subtitle_source='OSN',watched=0,imdb_rating=7.5,favorite=0,sub_count=2,arabic_count=1,english_count=1,subtitle_sources='OSN,Netflix') for i,(title,year) in enumerate([('Dont Look Up',2021),('Brick',2025),('The Dark Knight',2008)])]
 film=dict(movies[0]);film.update({'root_path':r'D:\Movies','path':r'D:\Movies\Dont Look Up.mkv','original_filename':'Dont Look Up (2021) [1080p].mkv','current_filename':'Dont Look Up.mkv','notes':'','translation_quality':'Excellent','poster_credit':'','hdr':0,'resolution':'1920x1080','video_bitrate':1000000,'audio_bitrate':128000,'audio_codec':'aac','overall_bitrate':1128000,'channels':2,'audio_layout':'stereo','probe_error':'','raw_probe':'{}','added_at':'2026-10-04','last_seen':'2026-10-04','manual_fields':[],'imdb_id':'','personal_rating':None,'preferred_subtitle_id':None,'playback_preference':'auto','cast_names':'Actor One, Actor Two','overview':'Test overview','subtitles':[{'id':1,'kind':'external','filename':'Arabic.osn.srt','path':r'D:\Movies\Arabic.osn.srt','format':'SRT','language':'Arabic','source':'OSN','quality':'Excellent','translator':''},{'id':2,'kind':'external','filename':'English.netflix.srt','path':r'D:\Movies\English.netflix.srt','format':'SRT','language':'English','source':'Netflix','quality':'Good','translator':''}]})
-base={'stats':{'total':3,'available':3,'missing':0,'offline':0,'disk_bytes':9000000,'catalog_bytes':9000000,'groups':1,'imdb_imported_at':None,'imdb_ratings_at':None,'ffprobe_found':True},'settings':{'poster_provider':'none','theme':'dark','default_external_subtitle_lang':'Arabic','auto_posters':'0','poster_in_folder':'0','archive_missing':'1','auto_imdb':'0'},'tmdb':{'connected':False},'gemini':{'connected':False},'roots':[],'data_dir':'D:\\MovieVault\\v2','active_job':None,'version':'2.0.0-rc.1'}
+base={'stats':{'total':3,'available':3,'missing':0,'offline':0,'disk_bytes':9000000,'catalog_bytes':9000000,'groups':1,'imdb_imported_at':None,'imdb_ratings_at':None,'ffprobe_found':True},'settings':{'poster_provider':'none','theme':'dark','default_external_subtitle_lang':'Arabic','auto_posters':'0','poster_in_folder':'0','archive_missing':'1','auto_imdb':'0'},'tmdb':{'connected':False},'gemini':{'connected':False},'roots':[],'data_dir':'D:\\MovieVault\\v2','active_job':None,'version':VERSION}
 mock_data={'/api/bootstrap':base,'/api/subtitle-sources':{'items':['Unknown','Netflix','OSN','Amazon Prime Video','Disney+','Manual','Other']},'/api/movies':{'total':3,'items':movies},'/api/movies/1':film}
 errors=[]
 with sync_playwright() as p:
