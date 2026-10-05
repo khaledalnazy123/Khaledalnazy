@@ -14,6 +14,8 @@ The current repository is **not release-ready**. Two findings are release blocke
 1. v1 migration copies arbitrary legacy `settings` rows, including secret-bearing rows, even though the UI and migration manifest promise that credentials are not imported.
 2. restore staging accepts an archive whose database is corrupt; the next launch fails before the UI opens, retains the pending archive, and repeats the failure on later launches.
 
+These are the only two confirmed defects designated as release-blocking: **MV-AUD-001** and **MV-AUD-002**. MV-AUD-003 through MV-AUD-008 are reproducible Medium-severity correctness and reliability defects. MV-AUD-009 through MV-AUD-012 remain confirmed supplementary UI/build findings and are not part of the eight runtime-defect set.
+
 Restore can also attach a stale poster from the pre-restore catalog to a different restored movie when the backup intentionally excludes TMDb cache files. Other confirmed defects affect scan resilience, job cancellation, IMDb identity consistency, movie titles beginning with a year, release-group collections, content relinking, build exit status, and release-version consistency.
 
 The 50 existing tests are useful regression tests, but they primarily exercise happy paths and mocked providers. They do not establish compatibility with a real v1 database, recovery after interrupted activation, native Windows behavior, provider contracts, large-library performance, or installer correctness.
@@ -61,6 +63,36 @@ The database layer lacks an explicit migration ledger and recovery state machine
 
 ## 2. Confirmed bugs
 
+### Final classification of the eight reproducible runtime defects
+
+All eight runtime defects were independently rerun on 2026-10-05 against the audited source commit with isolated, synthetic data. The targeted harness reproduced **8/8 defects in 6.335 seconds**. High severity is reserved here for a confidentiality or startup-availability failure in a normal migration/restore workflow that has no in-app recovery. Medium severity covers deterministic integrity, identity, or workflow failures with a narrower trigger or practical workaround and no modification of original movie files.
+
+| ID | Final severity | Release blocker | Classification basis |
+|---|---|---:|---|
+| MV-AUD-001 | **High** | **Yes** | Breaks the explicit credential-isolation promise and can propagate legacy secrets into v2 backups. |
+| MV-AUD-002 | **High** | **Yes** | A shaped but corrupt backup is staged and can prevent every subsequent normal startup until manual filesystem recovery. |
+| MV-AUD-003 | **Medium** | No | Misassociates cached artwork across restored catalogs; the restored database and original movie files remain intact. |
+| MV-AUD-004 | **Medium** | No | A common filesystem race aborts a scan, but the failure does not alter original media and the catalog remains reopenable. |
+| MV-AUD-005 | **Medium** | No | Cancellation is falsely reported while the complete IMDb index commits; impact is limited to generated metadata. |
+| MV-AUD-006 | **Medium** | No | Stored IMDb identity and displayed rating can disagree until rematched or manually corrected. |
+| MV-AUD-007 | **Medium** | No | A sampled-hash collision can attach catalog metadata to the wrong file; original movie bytes are not modified. |
+| MV-AUD-008 | **Medium** | No | Leading-year titles receive incorrect parsed metadata and fail automatic matching until corrected. |
+
+### Targeted reproduction evidence
+
+The rerun used a temporary Python harness outside the repository. It generated all SQLite databases, ZIP files, poster images, IMDb rows, and dummy video bytes under `/tmp`; it made no provider calls and accessed no personal files.
+
+| ID | Synthetic trigger | Exact observed result |
+|---|---|---|
+| MV-AUD-001 | Schema-2 source with `settings('tmdb_token','SYNTHETIC_LEGACY_SECRET')`; stage and activate into an empty v2 catalog. | The target retained the exact credential row and value. |
+| MV-AUD-002 | Valid product/schema manifest plus `movievault.sqlite` containing `not a sqlite database`. | Staging succeeded; activation raised `DatabaseError: file is not a database`; `restore_pending.zip` still existed after failure. |
+| MV-AUD-003 | Source movie ID 1 with a red TMDb poster excluded from its backup; destination movie ID 1 with a blue manual poster. | After restore, movie ID 1 described the source movie but served the destination's pre-restore blue poster. |
+| MV-AUD-004 | `os.walk` enumerated one video that was deleted immediately before `Path.stat()`. | Job state was `failed` with `UnboundLocalError: cannot access local variable 'old' where it is not associated with a value`. |
+| MV-AUD-005 | 60,000-row IMDb title import; a controlled per-row delay ensured cancellation was requested after the first 3,000-row batch. | Cancellation returned `accepted=True`; final state was `cancelled`; result and live database both contained all 60,000 rows. |
+| MV-AUD-006 | Movie locked to `tt2222222`/4.2; exact title/year candidate `tt1111111`/9.9. | Stored ID remained `tt2222222`, but the displayed rating became 9.9 from `tt1111111`. |
+| MV-AUD-007 | Two 1,000,000-byte files with different full SHA-256 digests and one differing byte at offset 200,000, outside sampled regions. | Sampled fingerprints matched; the second file was relinked to the first row, retaining the first file's original identity and year. |
+| MV-AUD-008 | Parse `1917 (2019).mkv` and `2001 A Space Odyssey (1968).mkv`. | Results were title `1917 (2019)`, year 1917 and title `2001 A Space Odyssey (1968)`, year 2001. |
+
 ### MV-AUD-001 — High — v1 migration imports legacy credentials from SQLite settings
 
 **Location:** `mv_migration.py:122-165`, especially the whole-database snapshot and the limited cleanup at lines 152-159.
@@ -85,7 +117,7 @@ The migration copies the complete v1 database and resets only `poster_provider` 
 
 **Required remediation:** Fully extract to a bounded temporary directory during staging, run ZIP CRC checks, `PRAGMA integrity_check`, schema/table checks, and application-level invariants before creating `restore_pending.zip`. On activation failure, quarantine the pending archive, preserve the live database, write a non-sensitive recovery record, and allow the app to start.
 
-### MV-AUD-003 — High — restore can attach a stale poster to a different restored movie
+### MV-AUD-003 — Medium — restore can attach a stale poster to a different restored movie
 
 **Location:** `mv_core.py:1059-1064` and `mv_core.py:1092-1112`.
 
@@ -139,7 +171,7 @@ When a user manually locks `imdb_id`, exact title/year matching may find another
 
 The fingerprint hashes file size plus only the first, middle, and last 64 KiB. Different same-size files can share those sampled regions. The relink path treats a unique unavailable fingerprint match as identity proof.
 
-**Reproduction:** Two distinct 1,000,000-byte synthetic files differed at byte 200,000, outside sampled regions, and produced the same fingerprint. After scanning `First Identity (2001).mkv`, deleting it, and adding `Different Identity (2022).mkv`, MovieVault relinked the same row: original/display identity stayed “First Identity” while the current file became “Different Identity”.
+**Reproduction:** Two distinct 1,000,000-byte synthetic files differed at byte 200,000, outside sampled regions, and produced the same fingerprint despite different full SHA-256 digests. After scanning `First Identity (2001).mkv`, deleting it, and adding `Second Identity (2022).mkv`, MovieVault relinked the same row: original/display identity stayed “First Identity” while the current file became “Second Identity”.
 
 **Impact:** Notes, ratings, preferred subtitles, and identity metadata can be attached to the wrong media file. Movie bytes are not modified.
 
@@ -323,22 +355,20 @@ The following require real Windows 10 and Windows 11 execution and remain unveri
 
 ## 8. Prioritized remediation roadmap
 
-### P0 — block release until complete
+### P0 — the two confirmed release-blocking defects
 
 1. Sanitize migrated settings with an explicit allowlist; add real-v1 fixtures and a safe cleanup migration for already imported credentials.
-2. Fully validate backup databases before staging; quarantine invalid pending restores and always allow startup with the current catalog.
-3. Make database + poster restoration a staged generation with deterministic clearing of absent poster references and interruption recovery.
-4. Fix the scan disappearance race and add phase-by-phase filesystem fault injection.
-5. Add a Windows CI/manual release gate that builds and runs the packaged app before any installer is distributed.
+2. Fully validate backup databases before staging; quarantine invalid pending restores, add durable activation/recovery markers, and always allow startup with the current catalog.
 
-### P1 — correctness and data identity
+### P1 — data integrity and runtime correctness
 
-1. Verify a full content hash before fingerprint relink and migrate existing rows additively.
-2. Make IMDb import/download cancellation real, transactional, and accurately reported.
-3. Keep IMDb ratings bound to the stored/locked IMDb ID.
-4. Correct year-leading title parsing and add a filename corpus.
-5. Add migration/restore activation markers and recovery tests for unexpected shutdown.
-6. Add concurrency protection for poster cache writes and other synchronous API changes that can overlap background jobs.
+1. Make database + poster restoration a staged generation with deterministic clearing of absent poster references and interruption recovery.
+2. Fix the scan disappearance race and add phase-by-phase filesystem fault injection.
+3. Verify a full content hash before fingerprint relink and migrate existing rows additively.
+4. Make IMDb import/download cancellation real, transactional, and accurately reported.
+5. Keep IMDb ratings bound to the stored/locked IMDb ID.
+6. Correct year-leading title parsing and add a filename corpus.
+7. Add concurrency protection for poster cache writes and other synchronous API changes that can overlap background jobs.
 
 ### P2 — release engineering and scale
 
@@ -349,6 +379,10 @@ The following require real Windows 10 and Windows 11 execution and remain unveri
 5. Lock/hash build dependencies, produce an SBOM, sign Windows artifacts, and verify packaged contents.
 6. Move visual-test artifacts out of tracked documentation and add live-server failure-path E2E tests.
 7. Harden Host checks, CSP, diagnostic redaction, and backup sensitivity messaging.
+
+### Release acceptance gate
+
+Build and run the packaged application on the Windows matrix before distributing an installer. This is a mandatory release prerequisite caused by the current evidence gap, rather than a third confirmed runtime defect.
 
 ## 9. Features requiring real Windows verification
 
@@ -371,7 +405,8 @@ Before release, execute every item in `docs/QA_CHECKLIST_AR.md` on disposable Wi
 - `node --check web/app.js` — **passed**.
 - `/workspace/movievault-env/bin/python -m pip check` — **passed; no broken requirements**.
 - Live local-server Playwright smoke with a real temporary SQLite catalog and real API calls — **1 movie card, 1 subtitle row, Midnight theme persisted, zero JavaScript page errors**.
-- Synthetic fault/recovery reproductions — confirmed findings MV-AUD-001 through MV-AUD-009.
+- Targeted synthetic runtime-defect harness rerun on 2026-10-05 — **8/8 reproduced in 6.335 seconds**, covering MV-AUD-001 through MV-AUD-008 with the exact outcomes recorded above.
+- Separate synthetic release-group reproduction — confirmed MV-AUD-009; MV-AUD-010 through MV-AUD-012 were confirmed by deterministic source/build-path inspection.
 - Synthetic flat-folder scan benchmark — 200/400/800 results shown above.
 - Static inspection of all Python, JavaScript, HTML/CSS, documentation, tests, PowerShell, batch, and Inno Setup source.
 
@@ -381,6 +416,6 @@ No personal movie files, real credentials, or external provider accounts were us
 
 **Decision: No-go for a stable public release or migration of irreplaceable user data.**
 
-The application is suitable for continued source-preview development with disposable data. The current automated suite demonstrates useful baseline behavior, and the architecture has several sound safety choices. It does not yet support a release claim because migration can violate credential isolation, restore can prevent startup and misassociate posters, and no Windows package has been built or accepted.
+The application is suitable for continued source-preview development with disposable data. The current automated suite demonstrates useful baseline behavior, and the architecture has several sound safety choices. The two defect-level release blockers are MV-AUD-001, because migration can violate credential isolation, and MV-AUD-002, because a staged corrupt restore can prevent startup. Poster misassociation and the other Medium/Low findings remain required correctness work under the priorities above. The unexecuted Windows package matrix is a separate release-acceptance prerequisite, not an additional confirmed defect.
 
 Complete all P0 items, add regression tests for every confirmed defect, run the real-v1 compatibility corpus, and pass the Windows release matrix before promoting beyond release-candidate source preview. Preserve existing v1 and v2 data through additive schema changes, staged copies, explicit backups, and failure-recovery tests; do not repair these issues by deleting, resetting, or silently rewriting user catalogs.
