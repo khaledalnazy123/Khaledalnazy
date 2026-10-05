@@ -274,7 +274,7 @@ class Catalog:
         self.tmdb_credentials=CredentialStore(self.dir)
         self.gemini_credentials=GeminiCredentials(self.dir)
         self.diagnostics=Diagnostics(self.dir)
-        self.job_lock=threading.Lock();self.jobs={};self.active_job=None
+        self.job_lock=threading.Lock();self.jobs={};self.active_job=None;self._exclusive_reservation=None
         # Keep user-facing edits narrow: unrelated movies may still be changed in
         # parallel, while one movie's metadata and poster generation are ordered.
         self._movie_locks_guard=threading.Lock();self._movie_locks={}
@@ -304,9 +304,19 @@ class Catalog:
         if not self.active_job:return None
         job=self.jobs.get(self.active_job)
         return job if job and job.get('state')=='running' else None
-    def _require_idle(self,message='Another library operation is running'):
+    @contextmanager
+    def _exclusive_maintenance(self,operation,message='Another library operation is running'):
+        """Reserve the background-job slot for one unsafe sync mutation."""
+        token=object()
         with self.job_lock:
             if self._active_job_unlocked():raise BusyError(message)
+            if self._exclusive_reservation is not None:raise BusyError(message)
+            self._exclusive_reservation=(token,str(operation))
+        try:yield
+        finally:
+            with self.job_lock:
+                if self._exclusive_reservation and self._exclusive_reservation[0] is token:
+                    self._exclusive_reservation=None
     @contextmanager
     def connect(self):
         db=sqlite3.connect(str(self.db),timeout=45)
@@ -500,11 +510,11 @@ class Catalog:
         # A scan owns the current root snapshot until it has reconciled missing
         # entries. Disabling a root mid-scan would otherwise let that older
         # snapshot write statuses after the user's newer action.
-        self._require_idle('Wait for the current library operation before disabling a source folder')
-        with self.connect() as c:
-            if not c.execute('SELECT 1 FROM roots WHERE id=?',(root_id,)).fetchone():raise ValidationError('Root not found')
-            c.execute("UPDATE roots SET enabled=0,last_status='disabled' WHERE id=?",(root_id,))
-            c.execute("UPDATE movies SET status='offline' WHERE root_id=?",(root_id,))
+        with self._exclusive_maintenance('disable_root','Wait for the current library operation before disabling a source folder'):
+            with self.connect() as c:
+                if not c.execute('SELECT 1 FROM roots WHERE id=?',(root_id,)).fetchone():raise ValidationError('Root not found')
+                c.execute("UPDATE roots SET enabled=0,last_status='disabled' WHERE id=?",(root_id,))
+                c.execute("UPDATE movies SET status='offline' WHERE root_id=?",(root_id,))
     def stats(self):
         with self.connect() as c:
             r=c.execute("SELECT COUNT(*) total,COALESCE(SUM(status='available'),0) available,COALESCE(SUM(status='missing'),0) missing,COALESCE(SUM(status='offline'),0) offline,COALESCE(SUM(CASE WHEN status='available' THEN size_bytes ELSE 0 END),0) disk_bytes,COALESCE(SUM(size_bytes),0) catalog_bytes,COUNT(DISTINCT NULLIF(release_group,'')) groups FROM movies").fetchone()
@@ -868,6 +878,7 @@ class Catalog:
     def scan(self,root_ids=None):return self.start_job('scan',lambda j:self._scan_impl(j,root_ids))
     def start_job(self,kind,fn):
         with self.job_lock:
+            if self._exclusive_reservation is not None:raise BusyError('Exclusive library maintenance is running')
             if self._active_job_unlocked():raise BusyError('Another library operation is running')
             if len(self.jobs)>70:
                 finished=sorted((v for v in self.jobs.values() if v['state']!='running'),key=lambda x:x.get('finished',0))
@@ -1487,8 +1498,8 @@ class Catalog:
         _validate_restore_database(database,SCHEMA_VERSION)
         return database
     def _activate_restore_archive(self,pending:Path,manifest:dict):
-        self._require_idle('Wait for the current library operation before activating a restore')
-        with self._poster_state_lock:return self._activate_restore_archive_locked(pending,manifest)
+        with self._exclusive_maintenance('restore_activation','Wait for the current library operation before activating a restore'):
+            with self._poster_state_lock:return self._activate_restore_archive_locked(pending,manifest)
     def _activate_restore_archive_locked(self,pending:Path,manifest:dict):
         with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
             staged=Path(td)/'staged';staged.mkdir()

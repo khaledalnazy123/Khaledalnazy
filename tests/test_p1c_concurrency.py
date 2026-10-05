@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ class P1CConcurrencyTests(unittest.TestCase):
         self.catalog.set_settings({'auto_posters':'0','poster_in_folder':'0'})
         root=self.base/'movies';root.mkdir();self.video=root/'Race Movie (2020).mkv';self.video.write_bytes(b'movie')
         with self.catalog.connect() as db:
-            root_id=db.execute('INSERT INTO roots(path) VALUES(?)',(str(root),)).lastrowid
+            root_id=db.execute('INSERT INTO roots(path) VALUES(?)',(str(root),)).lastrowid;self.root_id=root_id
             self.mid=db.execute(
                 '''INSERT INTO movies(root_id,relative_path,original_filename,current_filename,
                    display_title,year,status,added_at,last_seen,manual_fields)
@@ -119,6 +120,63 @@ class P1CConcurrencyTests(unittest.TestCase):
         self.assertEqual((movie['display_title'],movie['year'],movie['imdb_id']),('Manual Title',2033,'tt9999999'))
         self.assertEqual(movie['overview'],'');self.assertIsNone(movie['tmdb_id'])
         self.assertTrue(job['result']['stale'])
+
+    def test_disable_root_reservation_rejects_scan_before_root_mutation(self):
+        claimed=threading.Event();release=threading.Event();done=threading.Event();errors=[]
+        real_guard=self.catalog._exclusive_maintenance
+        @contextmanager
+        def blocking_guard(operation,message):
+            with real_guard(operation,message):
+                claimed.set()
+                if not release.wait(5):raise TimeoutError('test release timeout')
+                yield
+        scan_entered=threading.Event()
+        def disable():
+            try:self.catalog.disable_root(self.root_id)
+            except Exception as exc:errors.append(exc)
+            finally:done.set()
+        with patch.object(self.catalog,'_exclusive_maintenance',blocking_guard),patch.object(self.catalog,'_scan_impl',side_effect=lambda *_:scan_entered.set()):
+            worker=threading.Thread(target=disable);worker.start()
+            self.assertTrue(claimed.wait(5))
+            try:
+                with self.assertRaisesRegex(BusyError,'maintenance'):
+                    self.catalog.scan([self.root_id])
+                with self.catalog.connect() as db:
+                    self.assertEqual(db.execute('SELECT enabled FROM roots WHERE id=?',(self.root_id,)).fetchone()['enabled'],1)
+                self.assertFalse(scan_entered.is_set())
+            finally:release.set()
+            self.assertTrue(done.wait(5));worker.join()
+        self.assertFalse(errors)
+        with self.catalog.connect() as db:
+            self.assertEqual(db.execute('SELECT enabled FROM roots WHERE id=?',(self.root_id,)).fetchone()['enabled'],0)
+
+    def test_restore_reservation_rejects_background_job_during_activation(self):
+        entered=threading.Event();release=threading.Event();done=threading.Event();job_entered=threading.Event();errors=[]
+        def activation(_pending,_manifest):
+            entered.set()
+            if not release.wait(5):raise TimeoutError('test release timeout')
+            return True
+        def restore():
+            try:self.catalog._activate_restore_archive(self.base/'pending.zip',{'schema':mv_core.SCHEMA_VERSION})
+            except Exception as exc:errors.append(exc)
+            finally:done.set()
+        with patch.object(self.catalog,'_activate_restore_archive_locked',side_effect=activation):
+            worker=threading.Thread(target=restore);worker.start()
+            self.assertTrue(entered.wait(5))
+            try:
+                with self.assertRaisesRegex(BusyError,'maintenance'):
+                    self.catalog.start_job('must_not_enter',lambda _job:job_entered.set())
+                self.assertFalse(job_entered.is_set())
+            finally:release.set()
+            self.assertTrue(done.wait(5));worker.join()
+        self.assertFalse(errors);self.assertFalse(job_entered.is_set())
+
+    def test_failed_synchronous_maintenance_releases_reservation(self):
+        with patch.object(self.catalog,'_activate_restore_archive_locked',side_effect=RuntimeError('synthetic activation failure')):
+            with self.assertRaisesRegex(RuntimeError,'synthetic activation failure'):
+                self.catalog._activate_restore_archive(self.base/'pending.zip',{'schema':mv_core.SCHEMA_VERSION})
+        successor=self.wait_job(self.catalog.start_job('after_maintenance_failure',lambda _job:'ok'))
+        self.assertEqual(successor['state'],'completed');self.assertEqual(successor['result'],'ok')
 
     def test_simultaneous_exclusive_job_starts_allow_exactly_one(self):
         barrier=threading.Barrier(3);release=threading.Event();started=threading.Event();results=[]
