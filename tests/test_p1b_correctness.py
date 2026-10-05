@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import mv_core
 from mv_core import Catalog,parse_filename
 
 
@@ -143,6 +144,55 @@ class P1BCorrectnessTests(unittest.TestCase):
         with self.catalog.connect() as db:
             self.assertEqual(db.execute('SELECT tconst FROM imdb_titles').fetchone()['tconst'],'tt1234567')
         self.assertFalse((self.catalog.dir/'imdb_stage.sqlite').exists())
+
+    def test_title_cancellation_inside_live_transaction_rolls_back(self):
+        with self.catalog.connect() as db:
+            db.execute('INSERT INTO imdb_titles VALUES(?,?,?,?,?,?)',('tt9000000','sentinel','Sentinel',2000,'Drama',90))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('imdb_imported_at','previous-title-index')")
+        source=self.base/'title.basics.tsv.gz'
+        with gzip.open(source,'wt',encoding='utf8') as output:
+            output.write('tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n')
+            output.write('tt1234567\tmovie\tReplacement Movie\tReplacement Movie\t0\t2020\t\\N\t100\tAction\n')
+        real_check=mv_core._check_job_cancelled
+        def cancel_at_precommit(job,message):
+            if message.startswith('IMDb title import cancelled before commit') and not job.get('cancel'):
+                self.catalog.cancel_job(job['id'])
+            return real_check(job,message)
+        with patch('mv_core._check_job_cancelled',side_effect=cancel_at_precommit):
+            job=self.wait_job(self.catalog.import_imdb(source))
+        self.assertEqual(job['state'],'cancelled');self.assertFalse(job['commit_completed'])
+        with self.catalog.connect() as db:
+            rows=[tuple(row) for row in db.execute('SELECT tconst,primary_title FROM imdb_titles')]
+            imported_at=db.execute("SELECT value FROM meta WHERE key='imdb_imported_at'").fetchone()['value']
+        self.assertEqual(rows,[('tt9000000','Sentinel')]);self.assertEqual(imported_at,'previous-title-index')
+        self.assertFalse((self.catalog.dir/'imdb_stage.sqlite').exists())
+
+    def test_ratings_cancellation_inside_live_transaction_rolls_back_movies(self):
+        movie_id=self.movie('Rated Sentinel',2000)
+        with self.catalog.connect() as db:
+            db.execute('UPDATE movies SET imdb_id=?,imdb_rating=? WHERE id=?',('tt9000000',6.5,movie_id))
+            db.execute('INSERT INTO imdb_ratings VALUES(?,?,?)',('tt9000000',6.5,100))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('imdb_ratings_at','previous-ratings-index')")
+        source=self.base/'title.ratings.tsv.gz'
+        with gzip.open(source,'wt',encoding='utf8') as output:
+            output.write('tconst\taverageRating\tnumVotes\n')
+            output.write('tt9000000\t9.9\t9900\n')
+            output.write('tt1234567\t8.8\t8800\n')
+        real_check=mv_core._check_job_cancelled
+        def cancel_at_precommit(job,message):
+            if message.startswith('IMDb ratings import cancelled before commit') and not job.get('cancel'):
+                self.catalog.cancel_job(job['id'])
+            return real_check(job,message)
+        with patch('mv_core._check_job_cancelled',side_effect=cancel_at_precommit):
+            job=self.wait_job(self.catalog.import_imdb_ratings(source))
+        self.assertEqual(job['state'],'cancelled');self.assertFalse(job['commit_completed'])
+        with self.catalog.connect() as db:
+            ratings=[tuple(row) for row in db.execute('SELECT * FROM imdb_ratings')]
+            movie_rating=db.execute('SELECT imdb_rating FROM movies WHERE id=?',(movie_id,)).fetchone()['imdb_rating']
+            imported_at=db.execute("SELECT value FROM meta WHERE key='imdb_ratings_at'").fetchone()['value']
+        self.assertEqual(ratings,[('tt9000000',6.5,100)]);self.assertEqual(movie_rating,6.5)
+        self.assertEqual(imported_at,'previous-ratings-index')
+        self.assertFalse((self.catalog.dir/'imdb_ratings_stage.sqlite').exists())
 
     def test_locked_imdb_id_controls_manual_and_local_refresh_ratings(self):
         movie_id=self.movie();self.seed_identity_case(movie_id)

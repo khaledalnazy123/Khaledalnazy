@@ -6,6 +6,7 @@ This batch addresses only MV-AUD-005, MV-AUD-006, and MV-AUD-008 from `CODEX_INI
 
 - Title and ratings imports check cancellation throughout their row loops and immediately before live replacement. Ratings and title downloads also check before and after each bounded network read.
 - Imported data remains in private staging databases until an explicit transaction atomically replaces the corresponding live IMDb table and records its timestamp.
+- Each live replacement checks cancellation again after the potentially long insert/update statements and immediately before commit. A request received while those statements run therefore rolls back the still-open transaction, including movie-rating refreshes.
 - Cancellation before that commit raises a dedicated cancellation outcome, preserves the existing live index, and removes staging/download files in `finally` cleanup.
 - The job records whether its commit completed. A cancellation request arriving after the atomic replacement can stop optional post-import enrichment, but the final job state remains `completed` because the new live index is already committed.
 - Diagnostics and cancellation messages contain operation state only, not dataset paths.
@@ -25,11 +26,11 @@ This batch addresses only MV-AUD-005, MV-AUD-006, and MV-AUD-008 from `CODEX_INI
 
 ## Verification
 
-- Dedicated P1B regression tests: **8/8 passed in 0.134 seconds** with `ResourceWarning` promoted to an error.
-- Full unit/integration suite: **74/74 passed in 6.610 seconds**.
-- Strict full suite: **74/74 passed in 6.526 seconds** with `ResourceWarning` promoted to an error.
+- Dedicated P1B regression tests: **10/10 passed in 0.194 seconds** with `ResourceWarning` promoted to an error.
+- Full unit/integration suite: **76/76 passed in 6.704 seconds**.
+- Strict full suite: **76/76 passed in 6.676 seconds** with `ResourceWarning` promoted to an error.
 - Python compilation: **PASSED**.
-- Automated QA runner: **PASS** for 74 unit/integration tests, Python compilation, and Playwright visual smoke. See `qa_reports/QA_20261005_153909.txt` and `.json`.
+- Automated QA runner: **PASS** for 76 unit/integration tests, Python compilation, and Playwright visual smoke. See `qa_reports/QA_20261005_161401.txt` and `.json`.
 - A separate Playwright visual smoke run passed with three movie cards, settings panels, two subtitle rows, modal navigation, and no page errors.
 
 No Windows, WebView2, DPAPI, packaged executable, installer, VLC/mpv, or live-provider verification was performed in this batch.

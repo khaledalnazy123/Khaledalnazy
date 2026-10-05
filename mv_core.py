@@ -1129,6 +1129,7 @@ class Catalog:
                     c.execute('DELETE FROM imdb_titles')
                     c.execute('INSERT INTO imdb_titles SELECT * FROM stage.items')
                     c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_imported_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                    _check_job_cancelled(job,'IMDb title import cancelled before commit; live index was not changed.')
                     c.commit();job['commit_completed']=True
                 except Exception:
                     c.rollback();raise
@@ -1177,6 +1178,7 @@ class Catalog:
                     c.execute('INSERT INTO imdb_ratings SELECT * FROM incoming.ratings')
                     c.execute('UPDATE movies SET imdb_rating=(SELECT r.rating FROM imdb_ratings r WHERE r.tconst=movies.imdb_id) WHERE imdb_id IN (SELECT tconst FROM imdb_ratings)')
                     c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_ratings_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                    _check_job_cancelled(job,'IMDb ratings import cancelled before commit; live ratings were not changed.')
                     c.commit();job['commit_completed']=True
                 except Exception:
                     c.rollback();raise
