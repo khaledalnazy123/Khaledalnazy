@@ -22,7 +22,7 @@ for(const el of document.querySelectorAll('[data-setting]'))el.checked=state.con
 if(data.active_job&&data.active_job.state==='running')watchJob(data.active_job.id);}
 async function refreshBase(){let d=await api('/api/bootstrap');updateSidebar(d);return d;}
 function queryOptions(){const status=state.view==='archived'?(state.filter==='offline'?'offline':'missing'):(state.filter==='missing'||state.filter==='offline'?state.filter:'');let quality=['4K','1080p','720p','arabic_subs','no_subs','poster_missing'].includes(state.filter)?state.filter:'';
-const args=new URLSearchParams({q:state.group||state.q,status,quality,sort:state.sort,page:state.page,limit:state.limit});
+const args=new URLSearchParams({q:state.group?'':state.q,status,quality,sort:state.sort,page:state.page,limit:state.limit});if(state.group)args.set('release_group',state.group);
 for(const [field,id] of Object.entries({genre:'fGenre',actor:'fActor',subtitle_language:'fSubtitleLanguage',subtitle_source:'fSubtitleSource',translator:'fTranslator',year_from:'fYearFrom',year_to:'fYearTo',favorite:'fFavorite'})){const value=$(id).value.trim();if(value)args.set(field,value);}
 return args.toString();}
 async function refreshMovies(){const result=await api('/api/movies?'+queryOptions());state.total=result.total;$('countLabel').textContent=result.total.toLocaleString()+' movies';$('pageLabel').textContent=`Page ${state.page} / ${Math.max(1,Math.ceil(result.total/state.limit))}`;$('prevBtn').disabled=state.page<=1;$('nextBtn').disabled=state.page*state.limit>=result.total;

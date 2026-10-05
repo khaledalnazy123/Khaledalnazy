@@ -85,7 +85,7 @@ class Request(BaseHTTPRequestHandler):
                 try:return self._json(resolve_legacy_source())
                 except MigrationError as e:return self._json({'found':False,'hint':str(e),'suggested_path':str(legacy_data_dir())})
             if path=='/api/bootstrap':return self._json({'version':VERSION,'stats':cat.stats(),'roots':cat.roots(),'settings':cat.settings(),'tmdb':cat.tmdb_status(),'gemini':cat.gemini_status(),'data_dir':str(cat.dir),'active_job':cat.job(cat.active_job) if cat.active_job else None})
-            if path=='/api/movies':return self._json(cat.movies(q=arg('q'),status=arg('status'),quality=arg('quality'),sort=arg('sort','recent'),page=int(arg('page','1')),limit=int(arg('limit','54')),genre=arg('genre'),actor=arg('actor'),subtitle_language=arg('subtitle_language'),subtitle_source=arg('subtitle_source'),translator=arg('translator'),year_from=arg('year_from'),year_to=arg('year_to'),favorite=arg('favorite'),watched=arg('watched')))
+            if path=='/api/movies':return self._json(cat.movies(q=arg('q'),status=arg('status'),quality=arg('quality'),sort=arg('sort','recent'),page=int(arg('page','1')),limit=int(arg('limit','54')),genre=arg('genre'),actor=arg('actor'),subtitle_language=arg('subtitle_language'),subtitle_source=arg('subtitle_source'),translator=arg('translator'),year_from=arg('year_from'),year_to=arg('year_to'),favorite=arg('favorite'),watched=arg('watched'),release_group=arg('release_group')))
             if path=='/api/groups':return self._json({'items':cat.groups()})
             if path=='/api/subtitle-sources':return self._json({'items':cat.subtitle_sources()})
             if path=='/api/diagnostics/status':return self._json({'logging':True,'path':str(cat.diagnostics.folder),'credentials_included':False})

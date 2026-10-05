@@ -1,6 +1,6 @@
 """MovieVault: resilient local movie catalog. Python 3.10+; no network needed for scanning."""
 from __future__ import annotations
-import csv, gzip, hashlib, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error, zipfile
+import csv, gzip, hashlib, io, json, math, os, re, shutil, sqlite3, stat, subprocess, sys, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error, zipfile
 from contextlib import contextmanager,nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +21,18 @@ BACKUP_MAX_ARCHIVE_BYTES = 1_200_000_000
 BACKUP_MAX_UNCOMPRESSED_BYTES = 1_200_000_000
 BACKUP_MAX_DATABASE_BYTES = 1_000_000_000
 BACKUP_MAX_POSTER_BYTES = 12_000_000
+RAW_PROBE_MAX_BYTES = 128*1024
+RAW_PROBE_MAX_STREAMS = 256
+IMDB_TITLE_MAX_COMPRESSED_BYTES = 2*1024**3
+IMDB_TITLE_MAX_DECOMPRESSED_BYTES = 12*1024**3
+IMDB_TITLE_MAX_ROWS = 50_000_000
+IMDB_TITLE_MAX_LINE_BYTES = 1024*1024
+IMDB_TITLE_MAX_STAGE_BYTES = 16*1024**3
+IMDB_RATINGS_MAX_COMPRESSED_BYTES = 1024**3
+IMDB_RATINGS_MAX_DECOMPRESSED_BYTES = 4*1024**3
+IMDB_RATINGS_MAX_ROWS = 30_000_000
+IMDB_RATINGS_MAX_LINE_BYTES = 256*1024
+IMDB_RATINGS_MAX_STAGE_BYTES = 8*1024**3
 BACKUP_REQUIRED_TABLES = frozenset({'meta','roots','movies','subtitles','settings','imdb_titles'})
 BACKUP_REQUIRED_COLUMNS = {
     'meta': frozenset({'key','value'}),
@@ -181,6 +193,48 @@ def media_summary(raw:dict, stat_size:int, hints:dict) ->dict:
             'video_streams':len(videos),'subtitle_streams':len(subs),'container':fm.get('format_long_name') or fm.get('format_name',''),
             'probe_error':raw.get('probe_error','')}
 
+def sanitized_probe_snapshot(raw:dict) -> str:
+    """Persist only bounded FFprobe fields used by MovieVault's technical UI."""
+    raw=raw if isinstance(raw,dict) else {}
+    format_fields=('format_name','format_long_name','start_time','duration','size','bit_rate','probe_score')
+    stream_fields=('index','codec_name','codec_long_name','profile','codec_type','codec_tag_string','width','height',
+                   'coded_width','coded_height','pix_fmt','level','color_range','color_space','color_transfer','color_primaries',
+                   'chroma_location','field_order','refs','r_frame_rate','avg_frame_rate','time_base','start_time','duration',
+                   'bit_rate','bits_per_raw_sample','nb_frames','sample_fmt','sample_rate','channels','channel_layout')
+    minimal_fields=('index','codec_name','codec_type','width','height','pix_fmt','color_transfer','avg_frame_rate',
+                    'bit_rate','sample_rate','channels','channel_layout')
+    def scalar(value,limit=160):
+        if value is None or isinstance(value,(bool,int)):return value
+        if isinstance(value,float):return value if math.isfinite(value) else None
+        return str(value)[:limit]
+    def stream_copy(stream,fields):
+        item={key:scalar(stream.get(key)) for key in fields if stream.get(key) is not None}
+        disposition=stream.get('disposition') if isinstance(stream.get('disposition'),dict) else {}
+        kept={key:int(bool(disposition.get(key))) for key in ('default','forced','attached_pic','hearing_impaired','visual_impaired') if disposition.get(key) is not None}
+        if kept:item['disposition']=kept
+        tags=stream.get('tags') if isinstance(stream.get('tags'),dict) else {};safe_tags={}
+        if tags.get('language') is not None:safe_tags['language']=scalar(tags['language'],32)
+        if tags.get('title') is not None:safe_tags['title']=scalar(tags['title'],256)
+        if safe_tags:item['tags']=safe_tags
+        return item
+    all_streams=raw.get('streams') if isinstance(raw.get('streams'),list) else []
+    format_data=raw.get('format') if isinstance(raw.get('format'),dict) else {}
+    source_streams=[stream for stream in all_streams[:RAW_PROBE_MAX_STREAMS] if isinstance(stream,dict)]
+    snapshot={'format':{key:scalar(format_data.get(key)) for key in format_fields if format_data.get(key) is not None},
+              'streams':[stream_copy(stream,stream_fields) for stream in source_streams]}
+    if raw.get('probe_error'):snapshot['probe_error']=scalar(raw.get('probe_error'),250)
+    if len(all_streams)>RAW_PROBE_MAX_STREAMS:snapshot['streams_truncated']=True
+    def encode(value):return json.dumps(value,ensure_ascii=True,allow_nan=False,separators=(',',':'))
+    payload=encode(snapshot)
+    if len(payload.encode('utf8'))<=RAW_PROBE_MAX_BYTES:return payload
+    snapshot['streams']=[stream_copy(stream,minimal_fields) for stream in source_streams]
+    snapshot['probe_snapshot_minimized']=True;payload=encode(snapshot)
+    while snapshot['streams'] and len(payload.encode('utf8'))>RAW_PROBE_MAX_BYTES:
+        snapshot['streams'].pop();snapshot['streams_truncated']=True;payload=encode(snapshot)
+    if len(payload.encode('utf8'))>RAW_PROBE_MAX_BYTES:
+        snapshot={'format':{},'streams':[],'probe_snapshot_minimized':True,'streams_truncated':True};payload=encode(snapshot)
+    return payload
+
 def default_data_dir() -> Path:
     env=os.environ.get('MOVIEVAULT_DATA_DIR')
     if env:return Path(env).expanduser().resolve()
@@ -190,6 +244,51 @@ def default_data_dir() -> Path:
 class BusyError(Exception):pass
 class ValidationError(Exception):pass
 class JobCancelled(Exception):pass
+
+class _BoundedTextLines:
+    def __init__(self,stream,max_bytes,max_line_bytes,label):
+        self.stream=stream;self.max_bytes=max_bytes;self.max_line_bytes=max_line_bytes;self.label=label;self.total=0
+    def __iter__(self):return self
+    def __next__(self):
+        if hasattr(self.stream,'readline'):raw=self.stream.readline(self.max_line_bytes+1)
+        else:raw=next(self.stream)
+        if raw in (b'',''):raise StopIteration
+        encoded=raw.encode('utf8','replace') if isinstance(raw,str) else raw
+        if len(encoded)>self.max_line_bytes:raise ValidationError(f'{self.label} line exceeds safety limit')
+        self.total+=len(encoded)
+        if self.total>self.max_bytes:raise ValidationError(f'{self.label} decompressed data exceeds safety limit')
+        return raw if isinstance(raw,str) else raw.decode('utf8','replace')
+
+@contextmanager
+def _bounded_imdb_lines(path:Path,max_bytes:int,max_line_bytes:int,label:str):
+    opener=gzip.open if path.suffix=='.gz' else open
+    with opener(path,'rb') as stream:yield _BoundedTextLines(stream,max_bytes,max_line_bytes,label)
+
+def _sqlite_allocated_bytes(db:sqlite3.Connection) -> int:
+    return int(db.execute('PRAGMA page_count').fetchone()[0])*int(db.execute('PRAGMA page_size').fetchone()[0])
+
+def _is_regular_nonsymlink(path:Path) -> bool:
+    """Revalidate a cached path without following a symlink."""
+    try:return stat.S_ISREG(os.stat(path,follow_symlinks=False).st_mode)
+    except OSError:return False
+
+@contextmanager
+def _open_regular_nonsymlink(path:Path):
+    """Open a cached regular file without following a replacement symlink."""
+    before=os.stat(path,follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):raise OSError('Cached file is no longer a regular file')
+    flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0)
+    fd=os.open(path,flags)
+    try:
+        opened=os.fstat(fd);current=os.stat(path,follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise OSError('Cached file became unsafe')
+        if not os.path.samestat(before,current) or not os.path.samestat(opened,current):
+            raise OSError('Cached file changed before use')
+        with os.fdopen(fd,'rb') as source:
+            fd=-1;yield source
+    finally:
+        if fd>=0:os.close(fd)
 
 def _check_job_cancelled(job:dict,message='Cancelled before live data was replaced; existing data was kept.') -> None:
     if job.get('cancel'):raise JobCancelled(message)
@@ -517,19 +616,20 @@ class Catalog:
                 c.execute("UPDATE movies SET status='offline' WHERE root_id=?",(root_id,))
     def stats(self):
         with self.connect() as c:
-            r=c.execute("SELECT COUNT(*) total,COALESCE(SUM(status='available'),0) available,COALESCE(SUM(status='missing'),0) missing,COALESCE(SUM(status='offline'),0) offline,COALESCE(SUM(CASE WHEN status='available' THEN size_bytes ELSE 0 END),0) disk_bytes,COALESCE(SUM(size_bytes),0) catalog_bytes,COUNT(DISTINCT NULLIF(release_group,'')) groups FROM movies").fetchone()
+            r=c.execute("SELECT COUNT(*) total,COALESCE(SUM(status='available'),0) available,COALESCE(SUM(status='missing'),0) missing,COALESCE(SUM(status='offline'),0) offline,COALESCE(SUM(CASE WHEN status='available' THEN size_bytes ELSE 0 END),0) disk_bytes,COALESCE(SUM(size_bytes),0) catalog_bytes,COUNT(DISTINCT NULLIF(release_group,'') COLLATE NOCASE) groups FROM movies").fetchone()
             imdb=c.execute('SELECT value FROM meta WHERE key=?',('imdb_imported_at',)).fetchone()
             ratings=c.execute('SELECT value FROM meta WHERE key=?',('imdb_ratings_at',)).fetchone()
             return {**dict(r),'imdb_imported_at':imdb['value'] if imdb else None,'imdb_ratings_at':ratings['value'] if ratings else None, 'ffprobe_found':bool(find_ffprobe())}
     def groups(self):
         with self.connect() as c:
-            return [dict(r) for r in c.execute("SELECT release_group AS 'group',COUNT(*) AS count FROM movies WHERE release_group<>'' GROUP BY release_group ORDER BY count DESC,release_group COLLATE NOCASE LIMIT 100")]
-    def movies(self,q='',status='',quality='',sort='recent',page=1,limit=54, genre='',subtitle_language='',subtitle_source='',translator='',actor='',year_from=None,year_to=None,favorite='',watched=''):
+            return [dict(r) for r in c.execute("SELECT MIN(release_group) AS 'group',COUNT(*) AS count FROM movies WHERE release_group<>'' GROUP BY release_group COLLATE NOCASE ORDER BY count DESC,MIN(release_group) COLLATE NOCASE,MIN(release_group) LIMIT 100")]
+    def movies(self,q='',status='',quality='',sort='recent',page=1,limit=54, genre='',subtitle_language='',subtitle_source='',translator='',actor='',year_from=None,year_to=None,favorite='',watched='',release_group=''):
         page=max(1,int(page));limit=min(max(1,int(limit)),150)
         where=[];args=[]
         if q:
             where.append("(LOWER(display_title) LIKE ? ESCAPE '\\' OR LOWER(original_filename) LIKE ? ESCAPE '\\' OR LOWER(release_group) LIKE ? ESCAPE '\\' OR LOWER(genres) LIKE ? ESCAPE '\\' OR LOWER(cast_names) LIKE ? ESCAPE '\\' OR CAST(year AS TEXT) LIKE ? ESCAPE '\\')")
             key='%'+str(q).lower().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%';args.extend([key]*6)
+        if str(release_group).strip():where.append('release_group=? COLLATE NOCASE');args.append(str(release_group).strip())
         if status in ('available','missing','offline'):where.append('status=?');args.append(status)
         if quality in ('4K','1080p','720p','480p'):where.append('resolution_tag=?');args.append(quality)
         if quality=='arabic_subs':where.append("EXISTS(SELECT 1 FROM subtitles s WHERE s.movie_id=movies.id AND s.language='Arabic')")
@@ -632,29 +732,37 @@ class Catalog:
                 if not c.execute('SELECT 1 FROM subtitles WHERE id=? AND movie_id=?',(sub_id,row['movie_id'])).fetchone():raise ValidationError('Subtitle not found')
                 c.execute('UPDATE subtitles SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[sub_id])
         self.diagnostics.event('subtitle_metadata_changed',subtitle_id=sub_id,fields=','.join(sorted(values)))
-    def detect_subtitles(self,fp:Path,raw:dict,all_movies:int)->list:
+    def detect_subtitles(self,fp:Path,raw:dict,all_movies:int,external_files=None,default_external_lang=None)->list:
         result=[]
         for s in raw.get('streams',[]):
             if s.get('codec_type')=='subtitle':
                 tags=s.get('tags') or {};lang=LANGS.get((tags.get('language') or '').lower(),'Unknown')
                 result.append(('embedded',f'Stream #{s.get("index")}: {tags.get("title",s.get("codec_name","Subtitle"))}',s.get('codec_name',''),lang,s.get('index')))
         # Only associate stray unmatched subtitle files when there is exactly one movie in its folder.
-        try: entries=list(fp.parent.iterdir())
-        except OSError:return result
+        preassociated=external_files is not None
+        if preassociated:entries=external_files
+        else:
+            try:entries=list(fp.parent.iterdir())
+            except OSError:return result
         this=normalize(fp.stem);hints=parse_filename(fp.name);short=normalize(hints['title'])
         for p in entries:
-            if not p.is_file() or p.is_symlink() or p.suffix.lower() not in SUB_EXTS:continue
+            if p.suffix.lower() not in SUB_EXTS or not _is_regular_nonsymlink(p):continue
             key=normalize(p.stem)
-            matched=(all_movies==1 or key==this or key.startswith(this+' ') or key==short or key.startswith(short+' '))
+            matched=preassociated or all_movies==1 or key==this or key.startswith(this+' ') or key==short or key.startswith(short+' ')
             if not matched:continue
-            bits=re.findall(r'[A-Za-z]+',p.stem.lower());lang=next((LANGS[b] for b in bits[::-1] if b in LANGS),self.settings().get('default_external_subtitle_lang','Arabic'))
-            result.append(('external',p.name,p.suffix[1:].upper(),lang,None))
+            if default_external_lang is None:default_external_lang=self.settings().get('default_external_subtitle_lang','Arabic')
+            bits=re.findall(r'[A-Za-z]+',p.stem.lower());lang=next((LANGS[b] for b in bits[::-1] if b in LANGS),default_external_lang)
+            result.append(('external',p.name,p.suffix[1:].upper(),lang,None,p))
         return result
     def _sync_subtitles(self,c,mid:int,detected:list):
         # Preserve source and quality notes for an unchanged subtitle file/stream.
         existing={(s['kind'],s['filename']):dict(s) for s in c.execute('SELECT * FROM subtitles WHERE movie_id=?',(mid,))}
         keep=set()
-        for kind,name_,fmt,lang,stream_index in detected:
+        for item in detected:
+            kind,name_,fmt,lang,stream_index=item[:5];candidate=item[5] if len(item)>5 else None
+            # The folder index is only a candidate cache. Revalidate again at
+            # the database reconciliation boundary without re-enumerating.
+            if kind=='external' and candidate is not None and not _is_regular_nonsymlink(candidate):continue
             key=(kind,name_);keep.add(key);ex=existing.get(key)
             if ex:c.execute('UPDATE subtitles SET format=?,language=?,stream_index=? WHERE id=?',(fmt,ex['language'] if ex.get('language_manual') else lang,stream_index,ex['id']))
             else:c.execute('INSERT OR IGNORE INTO subtitles(movie_id,kind,filename,format,language,stream_index) VALUES(?,?,?,?,?,?)',(mid,kind,name_,fmt,lang,stream_index))
@@ -701,24 +809,43 @@ class Catalog:
                     c.execute("UPDATE movies SET status='offline' WHERE root_id=?",(rid,))
                 counts['offline']+=1;continue
             # Enumerate fully before marking entries missing; enumeration errors leave existing records untouched.
-            media=[];failed=False
+            media=[];folder_entries={};folder_media={};foldercounts={};failed=False
             def on_err(e):
                 nonlocal failed
                 failed=True;job['message']=f'Cannot fully inspect {e.filename}: {e.strerror}'
             try:
                 for base,dirs,files in os.walk(p,topdown=True,followlinks=False,onerror=on_err):
                     dirs[:]=[d for d in dirs if not (Path(base)/d).is_symlink()]
+                    folder=Path(base);entries=[]
                     for name in files:
                         f=Path(base)/name
-                        if f.suffix.lower() in VIDEO_EXTS and not f.is_symlink():media.append(f)
+                        if f.is_symlink():continue
+                        entries.append(f)
+                        if f.suffix.lower() in VIDEO_EXTS:
+                            media.append(f);folder_media.setdefault(folder,[]).append(f);foldercounts[folder]=foldercounts.get(folder,0)+1
+                    folder_entries[folder]=tuple(entries)
             except OSError:failed=True
             if failed:
                 with self.connect() as c:c.execute("UPDATE roots SET last_status='scan_error' WHERE id=?",(rid,))
                 counts['failed_files']+=1;continue
-            seen=[];root_failed_files=0
-            # map folder counts, allowing conservative subtitle association
-            foldercounts={}
-            for f in media:foldercounts[f.parent]=foldercounts.get(f.parent,0)+1
+            seen=[];root_failed_files=0;external_by_movie={};poster_files={}
+            # Reuse one filesystem snapshot for subtitle association and posters.
+            for folder,entries in folder_entries.items():
+                subtitles=[entry for entry in entries if entry.suffix.lower() in SUB_EXTS]
+                poster_files[folder]={entry.name.lower():entry for entry in entries if entry.name.lower() in POSTER_NAMES}
+                films=folder_media.get(folder,[])
+                if len(films)==1:external_by_movie[films[0]]=subtitles
+                elif films and subtitles:
+                    aliases={}
+                    for film in films:
+                        for alias in {normalize(film.stem),normalize(parse_filename(film.name)['title'])}:
+                            if alias:aliases.setdefault(alias,set()).add(film)
+                    for subtitle in subtitles:
+                        words=normalize(subtitle.stem).split();matches=set()
+                        for end in range(1,len(words)+1):matches.update(aliases.get(' '.join(words[:end]),()))
+                        for film in matches:external_by_movie.setdefault(film,[]).append(subtitle)
+            with self.connect() as c:
+                existing_by_rel={row['relative_path']:row for row in c.execute('SELECT * FROM movies WHERE root_id=?',(rid,)).fetchall()}
             job['total']+=len(media)
             for fp in media:
                 if job.get('cancel'):
@@ -726,9 +853,7 @@ class Catalog:
                     break
                 old=None;phase='path';job['message']=f'Scanning {fp.name[:80]}'
                 try:
-                    rel=str(fp.relative_to(p));phase='catalog_lookup'
-                    with self.connect() as c:
-                        old=c.execute('SELECT * FROM movies WHERE root_id=? AND relative_path=?',(rid,rel)).fetchone()
+                    rel=str(fp.relative_to(p));phase='catalog_lookup';old=existing_by_rel.get(rel)
                     phase='stat';st=fp.stat();now=time.strftime('%Y-%m-%dT%H:%M:%S%z');fingerprint=None
                     unchanged_id=None
                     if old and old['modified_ns']==st.st_mtime_ns and old['size_bytes']==st.st_size and old['status']=='available':
@@ -741,19 +866,20 @@ class Catalog:
                         phase='metadata_refresh'
                         with self._movie_lock(old['id']):
                             with self.connect() as c:
-                                c.execute('UPDATE movies SET last_seen=? WHERE id=?',(now,old['id']))
-                                c.execute('UPDATE movies SET content_sha256=? WHERE id=?',(content_sha256,old['id']))
+                                cached_raw=json.loads(old['raw_probe'] or '{}');stored_raw=sanitized_probe_snapshot(cached_raw);cached_raw=json.loads(stored_raw)
+                                c.execute('UPDATE movies SET last_seen=?,content_sha256=?,raw_probe=? WHERE id=?',(now,content_sha256,stored_raw,old['id']))
                                 # External subtitles and local poster.jpg can change even if video mtime is identical.
-                                cached_raw=json.loads(old['raw_probe'] or '{}')
-                                self._sync_subtitles(c,old['id'],self.detect_subtitles(fp,cached_raw,foldercounts[fp.parent]))
+                                detected=self.detect_subtitles(fp,cached_raw,foldercounts[fp.parent],external_by_movie.get(fp,()),settings.get('default_external_subtitle_lang','Arabic'))
+                                self._sync_subtitles(c,old['id'],detected)
                                 unchanged_id=old['id']
                     if unchanged_id is not None:
                         seen.append(unchanged_id);counts['unchanged']+=1;job['done']+=1
-                        if self._local_poster(unchanged_id,fp,settings):counts['posters_found']+=1
+                        if self._local_poster(unchanged_id,fp,settings,poster_files.get(fp.parent,{})):counts['posters_found']+=1
                         continue
                     phase='sampled_fingerprint';fingerprint=file_fingerprint(fp)
                     phase='full_hash';content_sha256=file_content_sha256(fp,st)
                     phase='probe';hints=parse_filename(fp.name);raw=probe_media(fp,ff);tech=media_summary(raw,st.st_size,hints)
+                    stored_raw=sanitized_probe_snapshot(raw);probe_snapshot=json.loads(stored_raw)
                     phase='stability_check';current=fp.stat()
                     if current.st_size!=st.st_size or current.st_mtime_ns!=st.st_mtime_ns:
                         raise OSError('Media changed during scan')
@@ -777,7 +903,7 @@ class Catalog:
                                 if current_row:old=current_row
                             locks=set(json.loads(old['manual_fields'])) if old else set()
                             fields={'root_id':rid,'relative_path':rel,'current_filename':fp.name,'last_seen':now,'modified_ns':st.st_mtime_ns,'fingerprint':fingerprint,'content_sha256':content_sha256,'status':'available',**tech}
-                            fields['raw_probe']=json.dumps(raw,ensure_ascii=False)
+                            fields['raw_probe']=stored_raw
                             if not old:
                                 fields.update({'original_filename':fp.name,'display_title':hints['title'],'year':hints['year'],'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag'],'added_at':now})
                             else:
@@ -793,10 +919,10 @@ class Catalog:
                             else:
                                 sql='INSERT INTO movies('+','.join(fields)+') VALUES('+','.join('?' for _ in fields)+')'
                                 mid=c.execute(sql,list(fields.values())).lastrowid;counts['added']+=1
-                            detected=self.detect_subtitles(fp,raw,foldercounts[fp.parent])
+                            detected=self.detect_subtitles(fp,probe_snapshot,foldercounts[fp.parent],external_by_movie.get(fp,()),settings.get('default_external_subtitle_lang','Arabic'))
                             self._sync_subtitles(c,mid,detected)
                     seen.append(mid);job['done']+=1
-                    if self._local_poster(mid,fp,settings):counts['posters_found']+=1
+                    if self._local_poster(mid,fp,settings,poster_files.get(fp.parent,{})):counts['posters_found']+=1
                     # Network artwork fetch is a separate job by design: scans should work offline and be responsive.
                 except (OSError,sqlite3.Error,ValueError) as e:
                     # An unreadable existing file must not be misclassified as deleted.
@@ -987,17 +1113,19 @@ class Catalog:
                 finally:
                     if tombstone:tombstone.unlink(missing_ok=True)
                 return True
-    def _local_poster(self,mid:int,fp:Path,settings:dict):
+    def _local_poster(self,mid:int,fp:Path,settings:dict,available=None):
+        if available is None:
+            try:available={p.name.lower():p for p in fp.parent.iterdir() if _is_regular_nonsymlink(p)}
+            except OSError:return False
+        candidate=next((available[x] for x in POSTER_NAMES if x in available),None)
+        if not candidate:return False
         try:version,movie=self._poster_context(mid)
         except ValidationError:return False
         if movie['poster_locked']:return False
         if movie['poster_path'] and (self.dir/movie['poster_path']).is_file():return False
-        available={p.name.lower():p for p in fp.parent.iterdir() if p.is_file() and not p.is_symlink()}
-        candidate=next((available[x] for x in POSTER_NAMES if x in available),None)
-        if not candidate:return False
         dst=self.posters/f'{mid}.jpg'
         try:
-            temp=self._poster_image(candidate,dst)
+            with _open_regular_nonsymlink(candidate) as source:temp=self._poster_image(source,dst)
             try:self._commit_poster(mid,temp,'local file',expected_version=version,automatic=True)
             finally:temp.unlink(missing_ok=True)
         except (OSError,ValueError,UnidentifiedImageError,Image.DecompressionBombError):return False
@@ -1234,7 +1362,7 @@ class Catalog:
             with urllib.request.urlopen(req,timeout=40) as source,part.open('wb') as output:
                 if urllib.parse.urlparse(source.geturl()).scheme!='https':raise ValidationError('IMDb dataset did not use HTTPS')
                 declared=int(source.headers.get('Content-Length') or 0)
-                if declared>1_200_000_000:raise ValidationError('Unexpectedly large IMDb download')
+                if declared>IMDB_TITLE_MAX_COMPRESSED_BYTES:raise ValidationError('Unexpectedly large IMDb download')
                 job['total']=declared;total=0
                 while True:
                     _check_job_cancelled(job,'IMDb title download cancelled; live index was not changed.')
@@ -1242,7 +1370,7 @@ class Catalog:
                     _check_job_cancelled(job,'IMDb title download cancelled; live index was not changed.')
                     if not chunk:break
                     total+=len(chunk)
-                    if total>1_200_000_000:raise ValidationError('IMDb dataset download exceeded size limit')
+                    if total>IMDB_TITLE_MAX_COMPRESSED_BYTES:raise ValidationError('IMDb dataset download exceeded size limit')
                     output.write(chunk);job['done']=total
                     job['message']=f'Downloading official IMDb dataset: {total//1048576:,} MB received'
             os.replace(part,target)
@@ -1254,9 +1382,8 @@ class Catalog:
             target.unlink(missing_ok=True)
     def _imdb_import_impl(self,job,path):
         p=Path(path).expanduser().resolve()
-        if not p.is_file() or not p.name.startswith('title.basics.tsv'):raise ValidationError('Select the official title.basics.tsv or title.basics.tsv.gz file')
+        if not p.is_file() or not p.name.startswith('title.basics.tsv') or p.stat().st_size>IMDB_TITLE_MAX_COMPRESSED_BYTES:raise ValidationError('Select the official title.basics.tsv or title.basics.tsv.gz file')
         _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
-        opener=gzip.open if p.suffix=='.gz' else open
         stage=self.dir/'imdb_stage.sqlite'
         try:stage.unlink(missing_ok=True)
         except OSError:raise ValidationError('Previous IMDb import is locked')
@@ -1264,23 +1391,31 @@ class Catalog:
         try:
             sc.execute('CREATE TABLE items(tconst TEXT PRIMARY KEY,title_norm TEXT,primary_title TEXT,year INTEGER,genres TEXT,runtime INTEGER)')
             batch=[]
-            with opener(p,'rt',encoding='utf-8',newline='',errors='replace') as stream:
+            rows_seen=0
+            with _bounded_imdb_lines(p,IMDB_TITLE_MAX_DECOMPRESSED_BYTES,IMDB_TITLE_MAX_LINE_BYTES,'IMDb title dataset') as stream:
                 reader=csv.DictReader(stream,delimiter='\t')
                 needed={'tconst','titleType','primaryTitle','startYear','genres'}
                 if not reader.fieldnames or not needed.issubset(set(reader.fieldnames)):raise ValidationError('Not an IMDb title.basics dataset')
                 for row in reader:
                     _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
+                    rows_seen+=1
+                    if rows_seen>IMDB_TITLE_MAX_ROWS:raise ValidationError('IMDb title dataset row count exceeds safety limit')
+                    if any(len(str(row.get(key) or '').encode('utf8','replace'))>limit for key,limit in (('tconst',20),('titleType',32),('primaryTitle',1000),('startYear',16),('genres',1000),('runtimeMinutes',32))):
+                        raise ValidationError('IMDb title field exceeds safety limit')
                     if row['titleType'] not in ('movie','tvMovie') or row.get('isAdult')=='1':continue
                     title=row['primaryTitle']; n=normalize(title)
-                    if not n:continue
+                    if not n or not re.fullmatch(r'tt\d{5,12}',row['tconst']):continue
                     year=clean_year(row.get('startYear')); genres=row.get('genres','').replace('\\N','')
                     try:runtime=int(row['runtimeMinutes'])
                     except (ValueError,KeyError,TypeError):runtime=None
                     batch.append((row['tconst'],n,title,year,genres,runtime))
                     if len(batch)>=3000:
                         sc.executemany('INSERT OR IGNORE INTO items VALUES(?,?,?,?,?,?)',batch);count+=len(batch);batch=[]
+                        if _sqlite_allocated_bytes(sc)>IMDB_TITLE_MAX_STAGE_BYTES:raise ValidationError('IMDb title staging database exceeds safety limit')
                         job['done']=count;job['message']=f'Imported {count:,} IMDb movie titles…'
-                if batch:sc.executemany('INSERT OR IGNORE INTO items VALUES(?,?,?,?,?,?)',batch);count+=len(batch)
+                if batch:
+                    sc.executemany('INSERT OR IGNORE INTO items VALUES(?,?,?,?,?,?)',batch);count+=len(batch)
+                    if _sqlite_allocated_bytes(sc)>IMDB_TITLE_MAX_STAGE_BYTES:raise ValidationError('IMDb title staging database exceeds safety limit')
             sc.commit()
             if count<1:raise ValidationError('No films found in dataset')
             _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
@@ -1305,7 +1440,7 @@ class Catalog:
             except OSError:pass
     def _imdb_ratings_import_impl(self,job,path):
         src=Path(path).expanduser().resolve()
-        if not src.is_file() or not src.name.startswith('title.ratings.tsv') or src.stat().st_size>500_000_000:
+        if not src.is_file() or not src.name.startswith('title.ratings.tsv') or src.stat().st_size>IMDB_RATINGS_MAX_COMPRESSED_BYTES:
             raise ValidationError('Select an official title.ratings.tsv.gz file')
         _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
         stage=self.dir/'imdb_ratings_stage.sqlite'
@@ -1313,13 +1448,17 @@ class Catalog:
         stage_db=sqlite3.connect(str(stage));counter=0
         try:
             stage_db.execute('CREATE TABLE ratings(tconst TEXT PRIMARY KEY,rating REAL,votes INTEGER)')
-            opener=gzip.open if src.suffix=='.gz' else open
-            with opener(src,'rt',encoding='utf8',newline='',errors='replace') as source:
+            rows_seen=0
+            with _bounded_imdb_lines(src,IMDB_RATINGS_MAX_DECOMPRESSED_BYTES,IMDB_RATINGS_MAX_LINE_BYTES,'IMDb ratings dataset') as source:
                 reader=csv.DictReader(source,delimiter='\t')
                 if not reader.fieldnames or not {'tconst','averageRating','numVotes'}.issubset(reader.fieldnames):raise ValidationError('Invalid IMDb ratings dataset')
                 batch=[]
                 for r in reader:
                     _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
+                    rows_seen+=1
+                    if rows_seen>IMDB_RATINGS_MAX_ROWS:raise ValidationError('IMDb ratings dataset row count exceeds safety limit')
+                    if any(len(str(r.get(key) or '').encode('utf8','replace'))>32 for key in ('tconst','averageRating','numVotes')):
+                        raise ValidationError('IMDb ratings field exceeds safety limit')
                     if not re.fullmatch(r'tt\d{5,12}',r['tconst']):continue
                     try:rating=float(r['averageRating']);votes=int(r['numVotes'])
                     except (ValueError,TypeError):continue
@@ -1327,8 +1466,11 @@ class Catalog:
                     batch.append((r['tconst'],rating,votes))
                     if len(batch)>=4000:
                         stage_db.executemany('INSERT OR REPLACE INTO ratings VALUES(?,?,?)',batch)
+                        if _sqlite_allocated_bytes(stage_db)>IMDB_RATINGS_MAX_STAGE_BYTES:raise ValidationError('IMDb ratings staging database exceeds safety limit')
                         counter+=len(batch);batch=[];job['done']=counter;job['message']=f'Indexed {counter:,} IMDb ratings…'
-                if batch:stage_db.executemany('INSERT OR REPLACE INTO ratings VALUES(?,?,?)',batch);counter+=len(batch)
+                if batch:
+                    stage_db.executemany('INSERT OR REPLACE INTO ratings VALUES(?,?,?)',batch);counter+=len(batch)
+                    if _sqlite_allocated_bytes(stage_db)>IMDB_RATINGS_MAX_STAGE_BYTES:raise ValidationError('IMDb ratings staging database exceeds safety limit')
             if not counter:raise ValidationError('No valid IMDb ratings found')
             stage_db.commit();stage_db.close();stage_db=None
             _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
@@ -1364,7 +1506,7 @@ class Catalog:
                     _check_job_cancelled(job,'IMDb ratings download cancelled; live ratings were not changed.')
                     if not chunk:break
                     size+=len(chunk)
-                    if size>500_000_000:raise ValidationError('Ratings dataset exceeded size limit')
+                    if size>IMDB_RATINGS_MAX_COMPRESSED_BYTES:raise ValidationError('Ratings dataset exceeded size limit')
                     out.write(chunk);job['done']=size;job['message']=f'Downloaded {size//1048576} MB of IMDb ratings'
             os.replace(part,target);job['done']=0
             return self._imdb_ratings_import_impl(job,target)
