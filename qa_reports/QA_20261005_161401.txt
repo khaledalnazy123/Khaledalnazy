@@ -1,0 +1,27 @@
+MovieVault Automated QA - PASS
+2026-10-05T16:14:12+0000
+Linux-6.18.44-x86_64-with-glibc2.41
+Python 3.12.14
+
+[PASS] Unit + integration regression tests (6.738s)
+  /opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python -m unittest discover -s tests -q
+  STDERR:
+----------------------------------------------------------------------
+Ran 76 tests in 6.542s
+
+OK
+
+[PASS] Python syntax compile (0.034s)
+  /opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python -m compileall -q mv_core.py mv_diagnostics.py mv_gemini.py mv_migration.py mv_playback.py mv_server.py mv_tmdb.py MovieVault.pyw dev.py tests
+
+[PASS] Visual browser smoke test (4.333s)
+  /opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python tests/visual_smoke.py
+  STDOUT:
+Home: cards= 3 errors= []
+Settings: migration= True gemini= True errors= []
+Details:  Dont Look Up (2021) subtitle rows= 2 errors= []
+Closing edit returns movie: 1
+VISUAL SMOKE PASSED
+
+This automated suite does not replace real Windows acceptance testing for WebView2, DPAPI, external API credentials, VLC/mpv and Setup.exe.
+JSON report: QA_20261005_161401.json
