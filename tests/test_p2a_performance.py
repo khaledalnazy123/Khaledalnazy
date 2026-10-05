@@ -63,8 +63,11 @@ class P2APerformanceTests(unittest.TestCase):
         )
         self.assertEqual([item['id'] for item in combined['items']],[exact])
         self.assertGreater(self.catalog.movies(q='YTS')['total'],self.catalog.movies(release_group='YTS')['total'])
-        groups={row['group'] for row in self.catalog.groups()}
-        self.assertNotIn('',groups);self.assertIn('Unknown',groups)
+        groups=self.catalog.groups();logical_yts=[row for row in groups if row['group'].casefold()=='yts']
+        self.assertEqual(logical_yts,[{'group':'YTS','count':2}])
+        self.assertEqual(logical_yts[0]['count'],self.catalog.movies(release_group='YTS')['total'])
+        self.assertEqual(self.catalog.stats()['groups'],len(groups))
+        self.assertNotIn('',{row['group'] for row in groups});self.assertIn('Unknown',{row['group'] for row in groups})
 
         server=MovieServer(self.catalog);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
@@ -94,6 +97,52 @@ class P2APerformanceTests(unittest.TestCase):
         self.assertEqual([(row['filename'],row['language']) for row in movie['subtitles']],[(subtitle.name,'English')])
         self.assertEqual(movie['poster_source'],'local file')
         self.assertTrue((self.catalog.dir/movie['poster_path']).is_file())
+
+    def test_cached_subtitle_disappearance_is_revalidated_without_new_enumeration(self):
+        media=self.root/'Vanishing Subtitle (2020).mkv';media.write_bytes(b'media'*30000)
+        subtitle=self.root/'Vanishing Subtitle (2020).en.srt';subtitle.write_text('synthetic',encoding='utf8')
+        def remove_after_snapshot(*_):
+            subtitle.unlink();return {'format':{'format_name':'matroska'},'streams':[]}
+        with patch('mv_core.probe_media',side_effect=remove_after_snapshot),\
+             patch.object(Path,'iterdir',side_effect=AssertionError('folder was listed again')):
+            result=self.catalog._scan_impl({'cancel':False,'total':0,'done':0,'message':''},[self.root_id])
+        self.assertEqual((result['added'],result['failed_files']),(1,0))
+        movie=self.catalog.movie(self.catalog.movies()['items'][0]['id'])
+        self.assertEqual([row for row in movie['subtitles'] if row['kind']=='external'],[])
+
+    def test_cached_poster_disappearance_is_not_imported(self):
+        media=self.root/'Vanishing Poster (2020).mkv';media.write_bytes(b'media'*30000)
+        poster=self.root/'poster.jpg'
+        from PIL import Image
+        Image.new('RGB',(40,60),'navy').save(poster)
+        def remove_after_snapshot(*_):
+            poster.unlink();return {'format':{'format_name':'matroska'},'streams':[]}
+        with patch('mv_core.probe_media',side_effect=remove_after_snapshot),\
+             patch.object(Path,'iterdir',side_effect=AssertionError('folder was listed again')):
+            result=self.catalog._scan_impl({'cancel':False,'total':0,'done':0,'message':''},[self.root_id])
+        movie=self.catalog.movie(self.catalog.movies()['items'][0]['id'])
+        self.assertEqual(result['posters_found'],0);self.assertEqual(movie['poster_path'],'')
+        self.assertFalse((self.catalog.posters/f"{movie['id']}.jpg").exists())
+
+    def test_cached_poster_replaced_by_symlink_is_not_followed(self):
+        media=self.root/'Unsafe Poster (2020).mkv';media.write_bytes(b'media'*30000)
+        poster=self.root/'poster.jpg';target=self.base/'outside-poster.jpg'
+        from PIL import Image
+        Image.new('RGB',(40,60),'navy').save(poster);Image.new('RGB',(40,60),'red').save(target)
+        probe_link=self.base/'symlink-capability-check'
+        try:
+            probe_link.symlink_to(target);probe_link.unlink()
+        except OSError as exc:
+            self.skipTest(f'Symlink creation is unavailable: {exc}')
+        def replace_after_snapshot(*_):
+            poster.unlink();poster.symlink_to(target)
+            return {'format':{'format_name':'matroska'},'streams':[]}
+        with patch('mv_core.probe_media',side_effect=replace_after_snapshot),\
+             patch.object(Path,'iterdir',side_effect=AssertionError('folder was listed again')):
+            result=self.catalog._scan_impl({'cancel':False,'total':0,'done':0,'message':''},[self.root_id])
+        movie=self.catalog.movie(self.catalog.movies()['items'][0]['id'])
+        self.assertEqual(result['posters_found'],0);self.assertEqual(movie['poster_path'],'')
+        self.assertFalse((self.catalog.posters/f"{movie['id']}.jpg").exists())
 
     def test_raw_probe_snapshot_is_valid_bounded_and_keeps_useful_metadata(self):
         media=self.root/'Probe Film (2022).mkv';media.write_bytes(b'probe-media'*20000)

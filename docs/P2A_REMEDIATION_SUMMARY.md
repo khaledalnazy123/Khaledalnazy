@@ -7,6 +7,8 @@ This batch addresses only the P2A scope from `CODEX_INITIAL_AUDIT.md`: exact rel
 - `/api/movies` now accepts a distinct `release_group` parameter. The backend uses a parameterized, case-insensitive equality predicate; it does not reuse the broad `q` search.
 - Collection navigation sends `release_group`, while the normal search box continues to send `q`.
 - Exact `YTS` does not match `YTSMX`, `MYTS`, or `YTS-OTHER`; exact `QXR` does not match `QXR-Group`.
+- Collection aggregation and sidebar group totals use the same case-insensitive SQLite identity as the exact filter. Case-only variants such as `YTS` and `yts` form one collection whose count equals the exact-filter total.
+- The collection label uses the binary minimum spelling within each case-insensitive group, producing a deterministic display value independent of row/query order.
 - Empty release-group input means no exact-group constraint. A literal `Unknown` value remains independently selectable, while blank groups remain excluded from the group collection list.
 - Resolution, year, and same-row subtitle filters continue to compose with the exact group predicate.
 
@@ -18,6 +20,8 @@ This batch addresses only the P2A scope from `CODEX_INITIAL_AUDIT.md`: exact rel
 - Unchanged files continue to avoid FFprobe and sampled/full hashing when their stored size and mtime match and a full digest already exists. Older rows without the additive full digest are still safely backfilled.
 - Per-file write boundaries, failure isolation, per-movie locking/current-row rereads, full-content relink verification, and per-file cancellation checks remain intact. The scan does not use one giant transaction.
 - Persisted probe data is normalized even on the unchanged path, so older unbounded snapshots shrink during normal rescans without re-probing media.
+- Cached external-subtitle paths are revalidated as non-symlink regular files during detection and again immediately at database reconciliation. A path removed or replaced after enumeration cannot leave stale subtitle metadata.
+- Cached local-poster paths are opened with no-follow semantics where the platform provides them, then the opened descriptor and current path identities are compared before image decoding. Missing, replaced, non-regular, and symlink candidates are rejected without a second folder enumeration.
 
 The full regression suite continues to exercise disappearing/inaccessible files, partial-scan missing/offline behavior, manual edits racing a scan, full-digest collision rejection, cancellation, immutable `original_filename`, and P0/P1 restore/concurrency behavior. The dedicated P2A module additionally proves that the folder cache preserves external subtitle and local-poster detection without any per-movie `iterdir()` fallback.
 
@@ -29,8 +33,8 @@ Reference run: Linux 6.18.44 x86_64, Python 3.12.14, local temporary storage, 20
 
 | Catalog size | Startup | List | Exact combined filter | Stats | Unchanged scan |
 |---:|---:|---:|---:|---:|---:|
-| 1,000 | 0.002252 s | 0.001160 s | 0.001100 s | 0.000915 s | 0.393838 s |
-| 10,000 | 0.004986 s | 0.002064 s | 0.001988 s | 0.003406 s | 3.983025 s |
+| 1,000 | 0.001695 s | 0.001071 s | 0.001127 s | 0.000680 s | 0.370631 s |
+| 10,000 | 0.005498 s | 0.002203 s | 0.001895 s | 0.003383 s | 4.054606 s |
 
 Regression budgets deliberately include broad CI/dev-machine margin rather than asserting microsecond behavior:
 
@@ -68,12 +72,13 @@ Both title and ratings paths enforce independent bounds while retaining P1B canc
 
 ## Verification
 
-- Dedicated P2A regression and benchmark tests: **7/7 passed in 5.031 seconds** with `ResourceWarning` promoted to an error.
-- Full unit/integration suite: **94/94 passed in 11.742 seconds**.
-- Strict full suite: **94/94 passed in 12.042 seconds** with `ResourceWarning` promoted to an error.
+- Dedicated P2A regression and benchmark tests: **10/10 passed in 4.918 seconds** with `ResourceWarning` promoted to an error.
+- Full unit/integration suite: **97/97 passed in 11.584 seconds**.
+- Strict full suite: **97/97 passed in 12.000 seconds** with `ResourceWarning` promoted to an error.
 - Python compilation and JavaScript syntax check: **PASSED**.
-- `qa_runner.py`: **PASS** for 94 tests, Python compilation, and Playwright visual smoke.
+- `qa_runner.py`: **PASS** for 97 tests, Python compilation, and Playwright visual smoke.
 - Standalone synthetic 1,000- and 10,000-movie benchmarks: **PASSED** within the documented budgets.
 - Oversized IMDb and adversarial probe tests: **PASSED** for compressed size, decompressed size, row count, line size, field size, staging allocation, live-index preservation, stage cleanup, valid bounded JSON, and preservation of technical/subtitle metadata.
+- Review follow-up fault injection: **PASSED** for case-folded collection totals, cached subtitle disappearance, cached poster disappearance, poster-to-symlink replacement, and continued one-pass folder enumeration.
 
 No Windows, WebView2, DPAPI, packaged executable, installer, VLC/mpv, real-library scale, or live-provider verification was performed in this batch.

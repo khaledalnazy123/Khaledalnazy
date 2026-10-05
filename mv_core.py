@@ -1,6 +1,6 @@
 """MovieVault: resilient local movie catalog. Python 3.10+; no network needed for scanning."""
 from __future__ import annotations
-import csv, gzip, hashlib, io, json, math, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error, zipfile
+import csv, gzip, hashlib, io, json, math, os, re, shutil, sqlite3, stat, subprocess, sys, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error, zipfile
 from contextlib import contextmanager,nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -266,6 +266,29 @@ def _bounded_imdb_lines(path:Path,max_bytes:int,max_line_bytes:int,label:str):
 
 def _sqlite_allocated_bytes(db:sqlite3.Connection) -> int:
     return int(db.execute('PRAGMA page_count').fetchone()[0])*int(db.execute('PRAGMA page_size').fetchone()[0])
+
+def _is_regular_nonsymlink(path:Path) -> bool:
+    """Revalidate a cached path without following a symlink."""
+    try:return stat.S_ISREG(os.stat(path,follow_symlinks=False).st_mode)
+    except OSError:return False
+
+@contextmanager
+def _open_regular_nonsymlink(path:Path):
+    """Open a cached regular file without following a replacement symlink."""
+    before=os.stat(path,follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):raise OSError('Cached file is no longer a regular file')
+    flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0)
+    fd=os.open(path,flags)
+    try:
+        opened=os.fstat(fd);current=os.stat(path,follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise OSError('Cached file became unsafe')
+        if not os.path.samestat(before,current) or not os.path.samestat(opened,current):
+            raise OSError('Cached file changed before use')
+        with os.fdopen(fd,'rb') as source:
+            fd=-1;yield source
+    finally:
+        if fd>=0:os.close(fd)
 
 def _check_job_cancelled(job:dict,message='Cancelled before live data was replaced; existing data was kept.') -> None:
     if job.get('cancel'):raise JobCancelled(message)
@@ -593,13 +616,13 @@ class Catalog:
                 c.execute("UPDATE movies SET status='offline' WHERE root_id=?",(root_id,))
     def stats(self):
         with self.connect() as c:
-            r=c.execute("SELECT COUNT(*) total,COALESCE(SUM(status='available'),0) available,COALESCE(SUM(status='missing'),0) missing,COALESCE(SUM(status='offline'),0) offline,COALESCE(SUM(CASE WHEN status='available' THEN size_bytes ELSE 0 END),0) disk_bytes,COALESCE(SUM(size_bytes),0) catalog_bytes,COUNT(DISTINCT NULLIF(release_group,'')) groups FROM movies").fetchone()
+            r=c.execute("SELECT COUNT(*) total,COALESCE(SUM(status='available'),0) available,COALESCE(SUM(status='missing'),0) missing,COALESCE(SUM(status='offline'),0) offline,COALESCE(SUM(CASE WHEN status='available' THEN size_bytes ELSE 0 END),0) disk_bytes,COALESCE(SUM(size_bytes),0) catalog_bytes,COUNT(DISTINCT NULLIF(release_group,'') COLLATE NOCASE) groups FROM movies").fetchone()
             imdb=c.execute('SELECT value FROM meta WHERE key=?',('imdb_imported_at',)).fetchone()
             ratings=c.execute('SELECT value FROM meta WHERE key=?',('imdb_ratings_at',)).fetchone()
             return {**dict(r),'imdb_imported_at':imdb['value'] if imdb else None,'imdb_ratings_at':ratings['value'] if ratings else None, 'ffprobe_found':bool(find_ffprobe())}
     def groups(self):
         with self.connect() as c:
-            return [dict(r) for r in c.execute("SELECT release_group AS 'group',COUNT(*) AS count FROM movies WHERE release_group<>'' GROUP BY release_group ORDER BY count DESC,release_group COLLATE NOCASE LIMIT 100")]
+            return [dict(r) for r in c.execute("SELECT MIN(release_group) AS 'group',COUNT(*) AS count FROM movies WHERE release_group<>'' GROUP BY release_group COLLATE NOCASE ORDER BY count DESC,MIN(release_group) COLLATE NOCASE,MIN(release_group) LIMIT 100")]
     def movies(self,q='',status='',quality='',sort='recent',page=1,limit=54, genre='',subtitle_language='',subtitle_source='',translator='',actor='',year_from=None,year_to=None,favorite='',watched='',release_group=''):
         page=max(1,int(page));limit=min(max(1,int(limit)),150)
         where=[];args=[]
@@ -723,19 +746,23 @@ class Catalog:
             except OSError:return result
         this=normalize(fp.stem);hints=parse_filename(fp.name);short=normalize(hints['title'])
         for p in entries:
-            if not preassociated and (not p.is_file() or p.is_symlink() or p.suffix.lower() not in SUB_EXTS):continue
+            if p.suffix.lower() not in SUB_EXTS or not _is_regular_nonsymlink(p):continue
             key=normalize(p.stem)
             matched=preassociated or all_movies==1 or key==this or key.startswith(this+' ') or key==short or key.startswith(short+' ')
             if not matched:continue
             if default_external_lang is None:default_external_lang=self.settings().get('default_external_subtitle_lang','Arabic')
             bits=re.findall(r'[A-Za-z]+',p.stem.lower());lang=next((LANGS[b] for b in bits[::-1] if b in LANGS),default_external_lang)
-            result.append(('external',p.name,p.suffix[1:].upper(),lang,None))
+            result.append(('external',p.name,p.suffix[1:].upper(),lang,None,p))
         return result
     def _sync_subtitles(self,c,mid:int,detected:list):
         # Preserve source and quality notes for an unchanged subtitle file/stream.
         existing={(s['kind'],s['filename']):dict(s) for s in c.execute('SELECT * FROM subtitles WHERE movie_id=?',(mid,))}
         keep=set()
-        for kind,name_,fmt,lang,stream_index in detected:
+        for item in detected:
+            kind,name_,fmt,lang,stream_index=item[:5];candidate=item[5] if len(item)>5 else None
+            # The folder index is only a candidate cache. Revalidate again at
+            # the database reconciliation boundary without re-enumerating.
+            if kind=='external' and candidate is not None and not _is_regular_nonsymlink(candidate):continue
             key=(kind,name_);keep.add(key);ex=existing.get(key)
             if ex:c.execute('UPDATE subtitles SET format=?,language=?,stream_index=? WHERE id=?',(fmt,ex['language'] if ex.get('language_manual') else lang,stream_index,ex['id']))
             else:c.execute('INSERT OR IGNORE INTO subtitles(movie_id,kind,filename,format,language,stream_index) VALUES(?,?,?,?,?,?)',(mid,kind,name_,fmt,lang,stream_index))
@@ -1088,7 +1115,7 @@ class Catalog:
                 return True
     def _local_poster(self,mid:int,fp:Path,settings:dict,available=None):
         if available is None:
-            try:available={p.name.lower():p for p in fp.parent.iterdir() if p.is_file() and not p.is_symlink()}
+            try:available={p.name.lower():p for p in fp.parent.iterdir() if _is_regular_nonsymlink(p)}
             except OSError:return False
         candidate=next((available[x] for x in POSTER_NAMES if x in available),None)
         if not candidate:return False
@@ -1098,7 +1125,7 @@ class Catalog:
         if movie['poster_path'] and (self.dir/movie['poster_path']).is_file():return False
         dst=self.posters/f'{mid}.jpg'
         try:
-            temp=self._poster_image(candidate,dst)
+            with _open_regular_nonsymlink(candidate) as source:temp=self._poster_image(source,dst)
             try:self._commit_poster(mid,temp,'local file',expected_version=version,automatic=True)
             finally:temp.unlink(missing_ok=True)
         except (OSError,ValueError,UnidentifiedImageError,Image.DecompressionBombError):return False
