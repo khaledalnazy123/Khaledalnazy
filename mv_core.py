@@ -38,6 +38,24 @@ BACKUP_REQUIRED_COLUMNS = {
     'settings': frozenset({'key','value'}),
     'imdb_titles': frozenset({'tconst','title_norm','primary_title','year','genres','runtime'}),
 }
+MOVIE_ADDITIVE_COLUMNS = {
+    'poster_attempted_at': "TEXT DEFAULT ''",
+    'resolution_verified': 'INTEGER DEFAULT 0',
+    'content_sha256': "TEXT DEFAULT ''",
+    'tmdb_id': 'INTEGER',
+    'cast_names': "TEXT DEFAULT ''",
+    'overview': "TEXT DEFAULT ''",
+    'tmdb_rating': 'REAL',
+    'tmdb_metadata_at': "TEXT DEFAULT ''",
+    'personal_rating': 'REAL',
+    'favorite': 'INTEGER DEFAULT 0',
+    'preferred_subtitle_id': 'INTEGER',
+    'playback_preference': "TEXT DEFAULT 'auto'",
+}
+SUBTITLE_ADDITIVE_COLUMNS = {
+    'language_manual': 'INTEGER DEFAULT 0',
+    'translator': "TEXT DEFAULT ''",
+}
 
 def normalize(v: str) -> str:
     v = unicodedata.normalize('NFKD', v or '').casefold()
@@ -78,6 +96,23 @@ def file_fingerprint(path:Path) -> str:
             f.seek(max(0,st.st_size//2-32768));h.update(f.read(65536))
         if st.st_size>65536:
             f.seek(max(0,st.st_size-65536));h.update(f.read(65536))
+    return h.hexdigest()
+
+def file_content_sha256(path:Path,expected_stat=None) -> str:
+    """Hash the complete media file without modifying it.
+
+    The sampled fingerprint remains a fast shortlist key. This digest is the
+    identity proof used before a catalog row can move to a different path.
+    """
+    h=hashlib.sha256()
+    with path.open('rb') as source:
+        while True:
+            chunk=source.read(1024*1024)
+            if not chunk:break
+            h.update(chunk)
+    final=path.stat()
+    if expected_stat is not None and (final.st_size!=expected_stat.st_size or final.st_mtime_ns!=expected_stat.st_mtime_ns):
+        raise OSError('Media changed while identity verification was in progress')
     return h.hexdigest()
 
 def find_ffmpeg() -> str|None:
@@ -187,6 +222,40 @@ def _validate_restore_database(path:Path,manifest_schema:int) -> None:
     except (sqlite3.DatabaseError,ValueError,OSError) as exc:
         raise ValidationError('Backup database is corrupt or unreadable') from exc
 
+def _ensure_additive_schema(db:sqlite3.Connection) -> None:
+    """Apply current non-destructive schema additions to an open catalog."""
+    existing={row[1] for row in db.execute('PRAGMA table_info(movies)')}
+    for name,definition in MOVIE_ADDITIVE_COLUMNS.items():
+        if name not in existing:db.execute(f'ALTER TABLE movies ADD COLUMN {name} {definition}')
+    subtitle_columns={row[1] for row in db.execute('PRAGMA table_info(subtitles)')}
+    for name,definition in SUBTITLE_ADDITIVE_COLUMNS.items():
+        if name not in subtitle_columns:db.execute(f'ALTER TABLE subtitles ADD COLUMN {name} {definition}')
+    db.execute('CREATE TABLE IF NOT EXISTS subtitle_sources(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
+    db.execute("CREATE TABLE IF NOT EXISTS ai_suggestions(movie_id INTEGER PRIMARY KEY,suggested_title TEXT,suggested_year INTEGER,suggested_imdb_id TEXT,reason TEXT,status TEXT,created_at TEXT)")
+
+def _upgrade_catalog_schema(db:sqlite3.Connection) -> None:
+    """Apply safe migrations and record the resulting current schema version."""
+    row=db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    previous_schema=int(row[0]) if row else 0
+    if previous_schema>SCHEMA_VERSION:raise RuntimeError('This library belongs to a newer MovieVault version. Refusing to modify it.')
+    _ensure_additive_schema(db)
+    if previous_schema<2:
+        db.execute("UPDATE movies SET resolution_tag=CASE WHEN width>=3400 OR height>=2000 THEN '4K' WHEN width>=1700 OR height>=1000 THEN '1080p' WHEN width>=1200 OR height>=700 THEN '720p' WHEN width>=700 OR height>=470 THEN '480p' ELSE 'SD' END,resolution_verified=1 WHERE width IS NOT NULL AND height IS NOT NULL")
+    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
+
+def _upgrade_restore_candidate_schema(path:Path) -> None:
+    """Normalize a validated private restore candidate before activation."""
+    db=sqlite3.connect(str(path),timeout=15)
+    try:
+        db.execute('PRAGMA trusted_schema=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
+        db.execute('PRAGMA journal_mode=DELETE')
+        _upgrade_catalog_schema(db)
+        db.commit()
+    except Exception:
+        db.rollback();raise
+    finally:db.close()
+
 class Catalog:
     def __init__(self,data_dir:Path|str|None=None):
         self.dir=Path(data_dir or default_data_dir());self.dir.mkdir(parents=True,exist_ok=True)
@@ -232,7 +301,7 @@ class Catalog:
                 audio_codec TEXT DEFAULT '',audio_bitrate INTEGER,overall_bitrate INTEGER,overall_bitrate_estimated INTEGER DEFAULT 0,
                 channels INTEGER,audio_layout TEXT DEFAULT '',fps TEXT DEFAULT '',hdr INTEGER DEFAULT 0,
                 audio_streams INTEGER DEFAULT 0,video_streams INTEGER DEFAULT 0,subtitle_streams INTEGER DEFAULT 0,container TEXT DEFAULT '',
-                probe_error TEXT DEFAULT '',raw_probe TEXT DEFAULT '{}',fingerprint TEXT DEFAULT '',status TEXT DEFAULT 'available',
+                probe_error TEXT DEFAULT '',raw_probe TEXT DEFAULT '{}',fingerprint TEXT DEFAULT '',content_sha256 TEXT DEFAULT '',status TEXT DEFAULT 'available',
                 added_at TEXT NOT NULL,last_seen TEXT NOT NULL,modified_ns INTEGER DEFAULT 0,
                 poster_path TEXT DEFAULT '',poster_source TEXT DEFAULT '',poster_credit TEXT DEFAULT '',poster_locked INTEGER DEFAULT 0,poster_attempted_at TEXT DEFAULT '',
                 subtitle_source TEXT DEFAULT 'Unknown',translation_quality TEXT DEFAULT 'Unrated',notes TEXT DEFAULT '',watched INTEGER DEFAULT 0,
@@ -246,26 +315,8 @@ class Catalog:
             CREATE INDEX IF NOT EXISTS imdb_title_norm_idx ON imdb_titles(title_norm,year);
             CREATE TABLE IF NOT EXISTS imdb_ratings(tconst TEXT PRIMARY KEY,rating REAL,votes INTEGER);
             ''')
-            row=c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row and int(row['value'])>SCHEMA_VERSION:raise RuntimeError('This library belongs to a newer MovieVault version. Refusing to modify it.')
-            # Safe additive migrations for earlier preview databases (never drop old data).
-            existing={r['name'] for r in c.execute('PRAGMA table_info(movies)')}
-            for name,definition in {
-                'poster_attempted_at':"TEXT DEFAULT ''",
-                'resolution_verified':'INTEGER DEFAULT 0',
-                'tmdb_id':'INTEGER', 'cast_names':"TEXT DEFAULT ''", 'overview':"TEXT DEFAULT ''", 'tmdb_rating':'REAL', 'tmdb_metadata_at':"TEXT DEFAULT ''",
-                'personal_rating':'REAL', 'favorite':'INTEGER DEFAULT 0',
-                'preferred_subtitle_id':'INTEGER', 'playback_preference':"TEXT DEFAULT 'auto'"
-            }.items():
-                if name not in existing:c.execute(f'ALTER TABLE movies ADD COLUMN {name} {definition}')
-            subtitlecols={r['name'] for r in c.execute('PRAGMA table_info(subtitles)')}
-            for name,definition in {'language_manual':'INTEGER DEFAULT 0','translator':"TEXT DEFAULT ''"}.items():
-                if name not in subtitlecols:c.execute(f'ALTER TABLE subtitles ADD COLUMN {name} {definition}')
-            c.execute('CREATE TABLE IF NOT EXISTS subtitle_sources(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
-            c.execute("CREATE TABLE IF NOT EXISTS ai_suggestions(movie_id INTEGER PRIMARY KEY,suggested_title TEXT,suggested_year INTEGER,suggested_imdb_id TEXT,reason TEXT,status TEXT,created_at TEXT)")
-            if row and int(row['value'])<2:
-                c.execute("UPDATE movies SET resolution_tag=CASE WHEN width>=3400 OR height>=2000 THEN '4K' WHEN width>=1700 OR height>=1000 THEN '1080p' WHEN width>=1200 OR height>=700 THEN '720p' WHEN width>=700 OR height>=470 THEN '480p' ELSE 'SD' END,resolution_verified=1 WHERE width IS NOT NULL AND height IS NOT NULL")
-            c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
+            # Safe migrations for earlier preview databases (never drop old data).
+            _upgrade_catalog_schema(c)
             for k,v in {'auto_posters':'1','poster_in_folder':'1','archive_missing':'1','auto_imdb':'1','poster_provider':'commons','default_external_subtitle_lang':'Arabic','theme':'dark','auto_frame_fallback':'0','auto_gemini_fallback':'0','gemini_model':''}.items():
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',(k,v))
             for r in c.execute("SELECT id,poster_path FROM movies WHERE poster_path<>''").fetchall():
@@ -578,7 +629,7 @@ class Catalog:
             if failed:
                 with self.connect() as c:c.execute("UPDATE roots SET last_status='scan_error' WHERE id=?",(rid,))
                 counts['failed_files']+=1;continue
-            seen=[]
+            seen=[];root_failed_files=0
             # map folder counts, allowing conservative subtitle association
             foldercounts={}
             for f in media:foldercounts[f.parent]=foldercounts.get(f.parent,0)+1
@@ -587,14 +638,24 @@ class Catalog:
                 if job.get('cancel'):
                     # Do not classify unseen files as Missing when a scan was cancelled.
                     break
-                rel=str(fp.relative_to(p));job['message']=f'Scanning {fp.name[:80]}'
+                old=None;phase='path';job['message']=f'Scanning {fp.name[:80]}'
                 try:
-                    st=fp.stat();now=time.strftime('%Y-%m-%dT%H:%M:%S%z');fingerprint=None
-                    unchanged_id=None
+                    rel=str(fp.relative_to(p));phase='catalog_lookup'
                     with self.connect() as c:
                         old=c.execute('SELECT * FROM movies WHERE root_id=? AND relative_path=?',(rid,rel)).fetchone()
-                        if old and old['modified_ns']==st.st_mtime_ns and old['size_bytes']==st.st_size and old['status']=='available':
+                    phase='stat';st=fp.stat();now=time.strftime('%Y-%m-%dT%H:%M:%S%z');fingerprint=None
+                    unchanged_id=None
+                    if old and old['modified_ns']==st.st_mtime_ns and old['size_bytes']==st.st_size and old['status']=='available':
+                        content_sha256=old['content_sha256']
+                        if not content_sha256:
+                            phase='full_hash';content_sha256=file_content_sha256(fp,st)
+                        phase='stability_check';current=fp.stat()
+                        if current.st_size!=st.st_size or current.st_mtime_ns!=st.st_mtime_ns:
+                            raise OSError('Media changed during scan')
+                        phase='metadata_refresh'
+                        with self.connect() as c:
                             c.execute('UPDATE movies SET last_seen=? WHERE id=?',(now,old['id']))
+                            c.execute('UPDATE movies SET content_sha256=? WHERE id=?',(content_sha256,old['id']))
                             # External subtitles and local poster.jpg can change even if video mtime is identical.
                             cached_raw=json.loads(old['raw_probe'] or '{}')
                             self._sync_subtitles(c,old['id'],self.detect_subtitles(fp,cached_raw,foldercounts[fp.parent]))
@@ -603,18 +664,25 @@ class Catalog:
                         seen.append(unchanged_id);counts['unchanged']+=1;job['done']+=1
                         if self._local_poster(unchanged_id,fp,settings):counts['posters_found']+=1
                         continue
-                    fingerprint=file_fingerprint(fp)
-                    hints=parse_filename(fp.name);raw=probe_media(fp,ff);tech=media_summary(raw,st.st_size,hints)
+                    phase='sampled_fingerprint';fingerprint=file_fingerprint(fp)
+                    phase='full_hash';content_sha256=file_content_sha256(fp,st)
+                    phase='probe';hints=parse_filename(fp.name);raw=probe_media(fp,ff);tech=media_summary(raw,st.st_size,hints)
+                    phase='stability_check';current=fp.stat()
+                    if current.st_size!=st.st_size or current.st_mtime_ns!=st.st_mtime_ns:
+                        raise OSError('Media changed during scan')
+                    phase='catalog_update'
                     with self.connect() as c:
                         if not old:
-                            # only relink an unavailable movie if the content fingerprint is unique
+                            # The sampled fingerprint only shortlists candidates. A
+                            # full digest match is required, and multiple matching
+                            # rows remain ambiguous rather than auto-relinking.
                             # A renamed/moved file can still be marked Available until this scan finishes.
-                            # Relink ONLY when its old physical path is gone and the fingerprint is unique.
                             candidates=c.execute("SELECT m.*,r.path AS candidate_root_path FROM movies m JOIN roots r ON r.id=m.root_id WHERE m.fingerprint=?",(fingerprint,)).fetchall()
-                            absent=[x for x in candidates if not (Path(x['candidate_root_path'])/x['relative_path']).is_file()]
-                            if len(absent)==1:old=absent[0]
+                            verified=[x for x in candidates if x['content_sha256'] and x['content_sha256']==content_sha256]
+                            if len(verified)==1 and not (Path(verified[0]['candidate_root_path'])/verified[0]['relative_path']).is_file():
+                                old=verified[0]
                         locks=set(json.loads(old['manual_fields'])) if old else set()
-                        fields={'root_id':rid,'relative_path':rel,'current_filename':fp.name,'last_seen':now,'modified_ns':st.st_mtime_ns,'fingerprint':fingerprint,'status':'available',**tech}
+                        fields={'root_id':rid,'relative_path':rel,'current_filename':fp.name,'last_seen':now,'modified_ns':st.st_mtime_ns,'fingerprint':fingerprint,'content_sha256':content_sha256,'status':'available',**tech}
                         fields['raw_probe']=json.dumps(raw,ensure_ascii=False)
                         if not old:
                             fields.update({'original_filename':fp.name,'display_title':hints['title'],'year':hints['year'],'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag'],'added_at':now})
@@ -643,7 +711,10 @@ class Catalog:
                 except (OSError,sqlite3.Error,ValueError) as e:
                     # An unreadable existing file must not be misclassified as deleted.
                     if old:seen.append(old['id'])
-                    counts['failed_files']+=1;job['done']+=1;job['message']=f'Skipped {fp.name}: {e}'
+                    counts['failed_files']+=1;root_failed_files+=1;job['done']+=1
+                    job['message']=f'Skipped {fp.name}: {type(e).__name__}'
+                    try:self.diagnostics.event('scan_file_skipped',root_id=rid,phase=phase,failure_type=type(e).__name__)
+                    except OSError:pass
             if job.get('cancel'):
                 with self.connect() as c:c.execute("UPDATE roots SET last_status='scan_cancelled' WHERE id=?",(rid,))
                 break
@@ -653,7 +724,8 @@ class Catalog:
                     r=c.execute(f"UPDATE movies SET status='missing' WHERE root_id=? AND status IN ('available','offline') AND id NOT IN ({q})",[rid]+seen)
                 else:r=c.execute("UPDATE movies SET status='missing' WHERE root_id=? AND status IN ('available','offline')",(rid,))
                 counts['missing']+=r.rowcount
-                c.execute("UPDATE roots SET last_status='online',last_scan=? WHERE id=?",(time.strftime('%Y-%m-%dT%H:%M:%S%z'),rid))
+                status='scan_partial' if root_failed_files else 'online'
+                c.execute("UPDATE roots SET last_status=?,last_scan=? WHERE id=?",(status,time.strftime('%Y-%m-%dT%H:%M:%S%z'),rid))
         job['result']=counts;job['message']='Scan completed; original file names and manual edits retained.'
         return counts
     def _refresh_local_metadata(self,job):
@@ -1178,6 +1250,7 @@ class Catalog:
         finally:part.unlink(missing_ok=True)
         return 'Backup fully validated and staged. Restart MovieVault to restore; a safety backup is created first.'
     def _extract_restore_archive(self,pending:Path,destination:Path,manifest:dict):
+        poster_generation=destination/'posters';poster_generation.mkdir()
         with zipfile.ZipFile(pending) as z:
             database=destination/'movievault.sqlite'
             with z.open('movievault.sqlite') as source,database.open('wb') as output:
@@ -1189,7 +1262,28 @@ class Catalog:
                 with z.open(info) as source,target.open('wb') as output:
                     copied=_copy_limited(source,output,BACKUP_MAX_POSTER_BYTES)
                 if copied!=info.file_size:raise ValidationError('Backup poster size is inconsistent')
+        # Validate the archive's original core structure before adding current
+        # runtime columns. This keeps older valid backups compatible without
+        # allowing normalization to conceal a malformed core schema.
         _validate_restore_database(database,int(manifest['schema']))
+        _upgrade_restore_candidate_schema(database)
+        # The staged database and poster directory are one catalog generation.
+        # Keep only members referenced by that database and clear every reference
+        # whose poster was intentionally omitted (including TMDb cache artwork).
+        with sqlite3.connect(str(database)) as db:
+            db.execute('PRAGMA journal_mode=DELETE')
+            rows={int(row[0]):row[1] for row in db.execute('SELECT id,poster_path FROM movies')}
+            for poster in poster_generation.iterdir():
+                movie_id=int(poster.stem)
+                expected=f'posters/{movie_id}.jpg'
+                stored=(rows.get(movie_id) or '').replace('\\','/')
+                if stored!=expected:poster.unlink(missing_ok=True)
+            for movie_id,poster_path in rows.items():
+                expected=f'posters/{movie_id}.jpg'
+                stored=(poster_path or '').replace('\\','/')
+                if stored!=expected or not (poster_generation/f'{movie_id}.jpg').is_file():
+                    db.execute("UPDATE movies SET poster_path='',poster_source='',poster_credit='',poster_locked=0,poster_attempted_at='' WHERE id=?",(movie_id,))
+        _validate_restore_database(database,SCHEMA_VERSION)
         return database
     def _activate_restore_archive(self,pending:Path,manifest:dict):
         with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
@@ -1200,7 +1294,7 @@ class Catalog:
             # can replace the live database or become visible to any API/provider.
             from mv_migration import sanitize_restored_migrated_v2_database
             sanitize_restored_migrated_v2_database(candidate)
-            _validate_restore_database(candidate,int(manifest['schema']))
+            _validate_restore_database(candidate,SCHEMA_VERSION)
             rollback=Path(td)/'live_before_restore.sqlite'
             with self.connect() as current:
                 snapshot=sqlite3.connect(str(rollback))
@@ -1210,9 +1304,8 @@ class Catalog:
             try:
                 for suffix in ('-wal','-shm'):(self.dir/('movievault.sqlite'+suffix)).unlink(missing_ok=True)
                 os.replace(candidate,self.db)
-                if (staged/'posters').exists():
-                    if self.posters.exists():os.replace(self.posters,old_posters)
-                    os.replace(staged/'posters',self.posters)
+                if self.posters.exists():os.replace(self.posters,old_posters)
+                os.replace(staged/'posters',self.posters)
             except Exception:
                 for suffix in ('-wal','-shm'):(self.dir/('movievault.sqlite'+suffix)).unlink(missing_ok=True)
                 # The rollback snapshot is a complete SQLite backup of the live
