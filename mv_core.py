@@ -70,8 +70,13 @@ def clean_year(v):
 
 def parse_filename(name: str) -> dict:
     stem=Path(name).stem
-    yr=re.search(r'(?<!\d)(18\d\d|19\d\d|20\d\d)(?!\d)',stem)
-    title=stem[:yr.start()] if yr else re.split(r'(?i)(?:[\[\( ](?:2160p|1080p|720p|480p|4k|bluray|brrip|web[- .]?dl|webrip|dvdrip|hdtv|remux)\b)',stem,maxsplit=1)[0]
+    years=list(re.finditer(r'(?<!\d)(18\d\d|19\d\d|20\d\d)(?!\d)',stem))
+    bracketed=[match for match in years if match.start()>0 and stem[match.start()-1] in '([{' and match.end()<len(stem) and stem[match.end()] in ')]}']
+    # A leading number can be the title itself (1917, 2001 A Space Odyssey).
+    # Prefer an explicit bracketed release year, then the last of multiple
+    # year-like tokens. A sole leading token is never treated as the year.
+    yr=bracketed[-1] if bracketed else years[-1] if len(years)>1 or (years and years[0].start()>0) else None
+    title=stem[:yr.start()] if yr else re.split(r'(?i)(?:[\[\( ._](?:2160p|1080p|720p|480p|4k|bluray|brrip|web[- .]?dl|webrip|dvdrip|hdtv|remux)\b)',stem,maxsplit=1)[0]
     title=re.sub(r'[._]+',' ',title)
     title=re.sub(r'[\s\[\]{}()\-]+$','',title).strip()
     if not title: title=re.sub(r'[._]',' ',stem).strip() or stem
@@ -184,6 +189,10 @@ def default_data_dir() -> Path:
 
 class BusyError(Exception):pass
 class ValidationError(Exception):pass
+class JobCancelled(Exception):pass
+
+def _check_job_cancelled(job:dict,message='Cancelled before live data was replaced; existing data was kept.') -> None:
+    if job.get('cancel'):raise JobCancelled(message)
 
 def _copy_limited(source,destination,max_bytes:int) -> int:
     total=0
@@ -403,11 +412,12 @@ class Catalog:
                 locks=set(movie['manual_fields']);fields={'tmdb_id':tmdb_id}
                 if 'display_title' not in locks:fields['display_title']=suggestion['title']
                 if 'year' not in locks and suggestion['year']:fields['year']=suggestion['year']
-                if 'imdb_id' not in locks:fields['imdb_id']=verified_id
-                rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(verified_id,)).fetchone()
-                if rating:fields['imdb_rating']=rating['rating']
-                row=c.execute('SELECT genres FROM imdb_titles WHERE tconst=?',(verified_id,)).fetchone()
-                if row and 'genres' not in locks:fields['genres']=row['genres']
+                if 'imdb_id' not in locks:
+                    fields['imdb_id']=verified_id
+                    rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(verified_id,)).fetchone()
+                    fields['imdb_rating']=rating['rating'] if rating else None
+                    row=c.execute('SELECT genres FROM imdb_titles WHERE tconst=?',(verified_id,)).fetchone()
+                    if row and 'genres' not in locks:fields['genres']=row['genres']
                 c.execute('UPDATE movies SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',list(fields.values())+[mid])
         job['message']='Gemini suggested a title; '+('independently verified by TMDB.' if status=='verified' else 'needs manual review.')
         return {'verified':status=='verified','suggestion':suggestion,'imdb_id':verified_id,'reason':extra}
@@ -549,6 +559,9 @@ class Catalog:
                     v=str(v).strip()[:(4000 if k=='notes' else 180)]
                     if k=='display_title' and not v:raise ValidationError('Movie title cannot be empty')
                 updates[k]=v;locks.add(k)
+            if 'imdb_id' in updates:
+                rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(updates['imdb_id'],)).fetchone() if updates['imdb_id'] else None
+                updates['imdb_rating']=rating['rating'] if rating else None
             updates['manual_fields']=json.dumps(sorted(locks))
             columns=','.join(f'{k}=?' for k in updates)
             c.execute(f'UPDATE movies SET {columns} WHERE id=?',list(updates.values())+[movie_id])
@@ -601,6 +614,24 @@ class Catalog:
             return None # never falsely assign a different year's movie
         r=c.execute('SELECT * FROM imdb_titles WHERE title_norm=? LIMIT 2',(n,)).fetchall()
         return dict(r[0]) if len(r)==1 else None
+    def _imdb_identity_updates(self,c,movie,hit,locks):
+        """Return metadata updates that all belong to one IMDb identity."""
+        record=dict(movie) if movie else {}
+        stored=str(record.get('imdb_id') or '')
+        if not re.fullmatch(r'tt\d{5,12}',stored):stored=''
+        candidate=str((hit or {}).get('tconst') or '')
+        updates={};identity=stored
+        if not identity and candidate and 'imdb_id' not in locks:
+            identity=candidate;updates['imdb_id']=candidate
+        if hit and identity==candidate:
+            for key,value in {'year':hit['year'],'genres':hit['genres']}.items():
+                if key not in locks:updates[key]=value
+        if identity:
+            rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(identity,)).fetchone()
+            updates['imdb_rating']=rating['rating'] if rating else None
+        elif record.get('imdb_rating') is not None:
+            updates['imdb_rating']=None
+        return updates
     def _scan_impl(self,job,root_ids=None):
         with self.connect() as c:
             roots=[dict(r) for r in c.execute('SELECT * FROM roots WHERE enabled=1 ORDER BY id')]
@@ -691,11 +722,7 @@ class Catalog:
                                 if k not in locks:fields[k]=v
                         if settings['auto_imdb']=='1':
                             hit=self._match_imdb(c,fields.get('display_title',old['display_title'] if old else ''),fields.get('year',old['year'] if old else None))
-                            if hit:
-                                rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(hit['tconst'],)).fetchone()
-                                if rating:fields['imdb_rating']=rating['rating']
-                                for k,v in {'year':hit['year'],'genres':hit['genres'],'imdb_id':hit['tconst']}.items():
-                                    if k not in locks:fields[k]=v
+                            fields.update(self._imdb_identity_updates(c,old,hit,locks))
                         if old:
                             # If the original row was at a different path, reconcile without replacing immutable first filename.
                             sql='UPDATE movies SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?'
@@ -731,21 +758,14 @@ class Catalog:
     def _refresh_local_metadata(self,job):
         matched=ratings=0
         with self.connect() as c:
-            rows=c.execute('SELECT id,display_title,year,imdb_id,manual_fields FROM movies').fetchall()
+            rows=c.execute('SELECT id,display_title,year,imdb_id,imdb_rating,manual_fields FROM movies').fetchall()
             for r in rows:
                 if job.get('cancel'):break
                 locks=set(json.loads(r['manual_fields']))
-                record_id=r['imdb_id'];hit=None
-                if not record_id:
-                    hit=self._match_imdb(c,r['display_title'],r['year'])
-                    if hit:record_id=hit['tconst'];matched+=1
-                changes={}
-                if hit:
-                    for k,v in {'imdb_id':hit['tconst'],'year':hit['year'],'genres':hit['genres']}.items():
-                        if k not in locks:changes[k]=v
-                if record_id:
-                    rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(record_id,)).fetchone()
-                    if rating:changes['imdb_rating']=rating['rating'];ratings+=1
+                hit=self._match_imdb(c,r['display_title'],r['year'])
+                changes=self._imdb_identity_updates(c,r,hit,locks)
+                if 'imdb_id' in changes:matched+=1
+                if changes.get('imdb_rating') is not None:ratings+=1
                 if changes:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in changes)+' WHERE id=?',list(changes.values())+[r['id']])
         return {'local_title_matches':matched,'ratings_refreshed':ratings}
     def _smart_update_impl(self,job,mode,include_gemini=False,limit=100):
@@ -796,13 +816,15 @@ class Catalog:
             if len(self.jobs)>70:
                 finished=sorted((v for v in self.jobs.values() if v['state']!='running'),key=lambda x:x.get('finished',0))
                 for old in finished[:len(self.jobs)-60]:self.jobs.pop(old['id'],None)
-            job_id=str(time.time_ns());job={'id':job_id,'type':kind,'state':'running','started':time.time(),'total':0,'done':0,'message':'Preparing…','result':None}
+            job_id=str(time.time_ns());job={'id':job_id,'type':kind,'state':'running','started':time.time(),'total':0,'done':0,'message':'Preparing…','result':None,'commit_completed':False}
             self.jobs[job_id]=job;self.active_job=job_id
         def run():
             outcome='completed'
             try:
                 job['result']=fn(job)
-                outcome='cancelled' if job.get('cancel') else 'completed'
+                outcome='cancelled' if job.get('cancel') and not job.get('commit_completed') else 'completed'
+            except JobCancelled as exc:
+                outcome='cancelled';job['message']=str(exc);job['result']={'cancelled':True,'committed':False}
             except Exception as exc:
                 outcome='failed';job['message']=f'{type(exc).__name__}: {exc}'
             finally:
@@ -980,8 +1002,9 @@ class Catalog:
             updates['tmdb_rating']=float(rating) if isinstance(rating,(int,float)) and 0<=rating<=10 else None
             if ext_imdb and 'imdb_id' not in locks and not movie.get('imdb_id'):
                 updates['imdb_id']=ext_imdb
-            ratingrow=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(ext_imdb or movie.get('imdb_id',''),)).fetchone()
-            if ratingrow:updates['imdb_rating']=ratingrow['rating']
+            rating_id=movie.get('imdb_id','') or (ext_imdb if 'imdb_id' not in locks else '')
+            ratingrow=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(rating_id,)).fetchone() if rating_id else None
+            updates['imdb_rating']=ratingrow['rating'] if ratingrow else None
             c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
         job['message']='Movie cast, overview and verified metadata refreshed.'
         return {'movie_id':mid,'cast_count':len(cast),'matched_by':method}
@@ -1028,13 +1051,11 @@ class Catalog:
         matches=0
         with self.connect() as c:
             # Existing unchanged films are enriched immediately after IMDb import.
-            rows=c.execute('SELECT id,display_title,year,manual_fields FROM movies').fetchall()
+            rows=c.execute('SELECT id,display_title,year,imdb_id,imdb_rating,manual_fields FROM movies').fetchall()
             for r in rows:
+                if job.get('cancel'):break
                 hit=self._match_imdb(c,r['display_title'],r['year'])
-                if not hit:continue
-                locks=set(json.loads(r['manual_fields']));vals={k:v for k,v in {'imdb_id':hit['tconst'],'genres':hit['genres'],'year':hit['year']}.items() if k not in locks}
-                rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(hit['tconst'],)).fetchone()
-                if rating:vals['imdb_rating']=rating['rating']
+                locks=set(json.loads(r['manual_fields']));vals=self._imdb_identity_updates(c,r,hit,locks)
                 if vals:
                     c.execute('UPDATE movies SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[r['id']]);matches+=1
         job['message']=f'IMDb imported; {matches} existing movie records enriched.'
@@ -1053,7 +1074,9 @@ class Catalog:
                 if declared>1_200_000_000:raise ValidationError('Unexpectedly large IMDb download')
                 job['total']=declared;total=0
                 while True:
+                    _check_job_cancelled(job,'IMDb title download cancelled; live index was not changed.')
                     chunk=source.read(1_048_576)
+                    _check_job_cancelled(job,'IMDb title download cancelled; live index was not changed.')
                     if not chunk:break
                     total+=len(chunk)
                     if total>1_200_000_000:raise ValidationError('IMDb dataset download exceeded size limit')
@@ -1069,6 +1092,7 @@ class Catalog:
     def _imdb_import_impl(self,job,path):
         p=Path(path).expanduser().resolve()
         if not p.is_file() or not p.name.startswith('title.basics.tsv'):raise ValidationError('Select the official title.basics.tsv or title.basics.tsv.gz file')
+        _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
         opener=gzip.open if p.suffix=='.gz' else open
         stage=self.dir/'imdb_stage.sqlite'
         try:stage.unlink(missing_ok=True)
@@ -1082,6 +1106,7 @@ class Catalog:
                 needed={'tconst','titleType','primaryTitle','startYear','genres'}
                 if not reader.fieldnames or not needed.issubset(set(reader.fieldnames)):raise ValidationError('Not an IMDb title.basics dataset')
                 for row in reader:
+                    _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
                     if row['titleType'] not in ('movie','tvMovie') or row.get('isAdult')=='1':continue
                     title=row['primaryTitle']; n=normalize(title)
                     if not n:continue
@@ -1095,13 +1120,19 @@ class Catalog:
                 if batch:sc.executemany('INSERT OR IGNORE INTO items VALUES(?,?,?,?,?,?)',batch);count+=len(batch)
             sc.commit()
             if count<1:raise ValidationError('No films found in dataset')
+            _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
             with self.connect() as c:
                 c.execute('ATTACH DATABASE ? AS stage',(str(stage),))
-                c.execute('DELETE FROM imdb_titles')
-                c.execute('INSERT INTO imdb_titles SELECT * FROM stage.items')
-                c.commit() # SQLite cannot DETACH an actively written attached database.
-                c.execute('DETACH DATABASE stage')
-                c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_imported_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                try:
+                    _check_job_cancelled(job,'IMDb title import cancelled; live index was not changed.')
+                    c.execute('BEGIN IMMEDIATE')
+                    c.execute('DELETE FROM imdb_titles')
+                    c.execute('INSERT INTO imdb_titles SELECT * FROM stage.items')
+                    c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_imported_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                    c.commit();job['commit_completed']=True
+                except Exception:
+                    c.rollback();raise
+                finally:c.execute('DETACH DATABASE stage')
             enriched=self._enrich_existing_movies(job)
             return {'titles_imported':count,'existing_movies_enriched':enriched}
         finally:
@@ -1112,6 +1143,7 @@ class Catalog:
         src=Path(path).expanduser().resolve()
         if not src.is_file() or not src.name.startswith('title.ratings.tsv') or src.stat().st_size>500_000_000:
             raise ValidationError('Select an official title.ratings.tsv.gz file')
+        _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
         stage=self.dir/'imdb_ratings_stage.sqlite'
         if stage.exists():raise ValidationError('Another ratings import is staged')
         stage_db=sqlite3.connect(str(stage));counter=0
@@ -1123,6 +1155,7 @@ class Catalog:
                 if not reader.fieldnames or not {'tconst','averageRating','numVotes'}.issubset(reader.fieldnames):raise ValidationError('Invalid IMDb ratings dataset')
                 batch=[]
                 for r in reader:
+                    _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
                     if not re.fullmatch(r'tt\d{5,12}',r['tconst']):continue
                     try:rating=float(r['averageRating']);votes=int(r['numVotes'])
                     except (ValueError,TypeError):continue
@@ -1134,13 +1167,20 @@ class Catalog:
                 if batch:stage_db.executemany('INSERT OR REPLACE INTO ratings VALUES(?,?,?)',batch);counter+=len(batch)
             if not counter:raise ValidationError('No valid IMDb ratings found')
             stage_db.commit();stage_db.close();stage_db=None
+            _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
             with self.connect() as c:
                 c.execute('ATTACH DATABASE ? AS incoming',(str(stage),))
-                c.execute('DELETE FROM imdb_ratings')
-                c.execute('INSERT INTO imdb_ratings SELECT * FROM incoming.ratings')
-                c.commit();c.execute('DETACH DATABASE incoming')
-                c.execute('UPDATE movies SET imdb_rating=(SELECT r.rating FROM imdb_ratings r WHERE r.tconst=movies.imdb_id) WHERE imdb_id IN (SELECT tconst FROM imdb_ratings)')
-                c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_ratings_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                try:
+                    _check_job_cancelled(job,'IMDb ratings import cancelled; live ratings were not changed.')
+                    c.execute('BEGIN IMMEDIATE')
+                    c.execute('DELETE FROM imdb_ratings')
+                    c.execute('INSERT INTO imdb_ratings SELECT * FROM incoming.ratings')
+                    c.execute('UPDATE movies SET imdb_rating=(SELECT r.rating FROM imdb_ratings r WHERE r.tconst=movies.imdb_id) WHERE imdb_id IN (SELECT tconst FROM imdb_ratings)')
+                    c.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('imdb_ratings_at',time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                    c.commit();job['commit_completed']=True
+                except Exception:
+                    c.rollback();raise
+                finally:c.execute('DETACH DATABASE incoming')
             return {'ratings_indexed':counter}
         finally:
             if stage_db:stage_db.close()
@@ -1154,7 +1194,9 @@ class Catalog:
                 if urllib.parse.urlsplit(src.geturl()).scheme!='https':raise ValidationError('Ratings dataset must download over HTTPS')
                 size=0
                 while True:
+                    _check_job_cancelled(job,'IMDb ratings download cancelled; live ratings were not changed.')
                     chunk=src.read(1048576)
+                    _check_job_cancelled(job,'IMDb ratings download cancelled; live ratings were not changed.')
                     if not chunk:break
                     size+=len(chunk)
                     if size>500_000_000:raise ValidationError('Ratings dataset exceeded size limit')
@@ -1169,13 +1211,9 @@ class Catalog:
         with self.connect() as c:
             hit=self._match_imdb(c,movie['display_title'],movie['year'])
             if not hit:return {'matched':False}
-            locks=set(movie['manual_fields']);updates={}
-            for k,v in {'genres':hit['genres'],'imdb_id':hit['tconst'],'year':hit['year']}.items():
-                if k not in locks:updates[k]=v
-            rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(hit['tconst'],)).fetchone()
-            if rating:updates['imdb_rating']=rating['rating']
+            locks=set(movie['manual_fields']);updates=self._imdb_identity_updates(c,movie,hit,locks)
             if updates:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
-            return {'matched':True,'imdb_id':hit['tconst'],'updates':updates}
+            return {'matched':True,'imdb_id':updates.get('imdb_id') or movie.get('imdb_id',''),'candidate_imdb_id':hit['tconst'],'updates':updates}
     def backup(self,target=None):
         dst=Path(target).expanduser().resolve() if target else self.backups/('MovieVault_Backup_'+time.strftime('%Y%m%d_%H%M%S')+'.zip')
         if dst.suffix.lower()!='.zip':raise ValidationError('Backup must have .zip extension')
