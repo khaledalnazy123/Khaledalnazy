@@ -1,7 +1,7 @@
 """MovieVault: resilient local movie catalog. Python 3.10+; no network needed for scanning."""
 from __future__ import annotations
 import csv, gzip, hashlib, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error, zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager,nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -275,6 +275,10 @@ class Catalog:
         self.gemini_credentials=GeminiCredentials(self.dir)
         self.diagnostics=Diagnostics(self.dir)
         self.job_lock=threading.Lock();self.jobs={};self.active_job=None
+        # Keep user-facing edits narrow: unrelated movies may still be changed in
+        # parallel, while one movie's metadata and poster generation are ordered.
+        self._movie_locks_guard=threading.Lock();self._movie_locks={}
+        self._poster_versions={};self._poster_policy_version=0;self._poster_state_lock=threading.Lock()
         self.initialize()
         # Older v2 builds could activate a v1 snapshot before removing arbitrary
         # legacy settings. Clean only catalogs marked as v1 imports, once, before
@@ -286,6 +290,23 @@ class Catalog:
         self.expire_tmdb_artwork()
         self.expire_tmdb_details()
         self.diagnostics.event('app_initialized',schema=SCHEMA_VERSION)
+    def _movie_lock(self,movie_id:int):
+        movie_id=int(movie_id)
+        with self._movie_locks_guard:
+            return self._movie_locks.setdefault(movie_id,threading.RLock())
+    def _poster_context(self,movie_id:int):
+        """Return a poster generation token and current movie snapshot."""
+        lock=self._movie_lock(movie_id)
+        with lock:
+            token=(self._poster_versions.get(int(movie_id),0),self._poster_policy_version)
+            return token,self.movie(movie_id)
+    def _active_job_unlocked(self):
+        if not self.active_job:return None
+        job=self.jobs.get(self.active_job)
+        return job if job and job.get('state')=='running' else None
+    def _require_idle(self,message='Another library operation is running'):
+        with self.job_lock:
+            if self._active_job_unlocked():raise BusyError(message)
     @contextmanager
     def connect(self):
         db=sqlite3.connect(str(self.db),timeout=45)
@@ -337,30 +358,32 @@ class Catalog:
         cutoff=datetime.now(timezone.utc)-timedelta(days=170)
         old=[]
         with self.connect() as c:
-            for r in c.execute("SELECT id,poster_attempted_at,poster_path FROM movies WHERE poster_source='TMDb'").fetchall():
+            for r in c.execute("SELECT id,poster_attempted_at FROM movies WHERE poster_source='TMDb'").fetchall():
                 try:date=datetime.fromisoformat(r['poster_attempted_at']).astimezone(timezone.utc)
                 except (ValueError,TypeError):date=datetime.min.replace(tzinfo=timezone.utc)
-                if date < cutoff:
-                    old.append(r['id'])
-                    c.execute("UPDATE movies SET poster_path='',poster_source='',poster_credit='',poster_attempted_at='' WHERE id=?",(r['id'],))
+                if date < cutoff:old.append(r['id'])
         for mid in old:
-            path=self.posters/f'{mid}.jpg'
-            if not path.is_symlink():path.unlink(missing_ok=True)
+            # Recheck the source under the poster locks so a newer manual upload
+            # cannot be cleared by this older expiration snapshot.
+            self.clear_poster(mid,expected_source='TMDb')
     def settings(self):
         with self.connect() as c:return {r['key']:r['value'] for r in c.execute('SELECT * FROM settings')}
     def set_settings(self,items:dict):
         allowed={'auto_posters','poster_in_folder','archive_missing','auto_imdb','poster_provider','default_external_subtitle_lang','theme','auto_frame_fallback','auto_gemini_fallback','gemini_model'}
         if set(items)-allowed:raise ValidationError('Unknown setting')
-        with self.connect() as c:
-            for k,v in items.items():
-                if k=='poster_provider' and v not in ('commons','tmdb','none'):raise ValidationError('Unknown poster provider')
-                if k=='poster_provider' and v=='tmdb' and not self.tmdb_credentials.get():raise ValidationError('Connect TMDB in Settings before enabling it')
-                if k=='gemini_model':
-                    if v and (not re.fullmatch(r'[A-Za-z0-9._-]{3,90}',str(v)) or str(v) not in GeminiClient(self.gemini_credentials.get()).models()):raise ValidationError('Select an available Gemini model')
-                elif k=='default_external_subtitle_lang' and str(v) not in ('Arabic','English','Unknown'):raise ValidationError('Invalid default subtitle language')
-                elif k=='theme' and str(v) not in ('dark','light','midnight'):raise ValidationError('Invalid interface theme')
-                elif k not in ('poster_provider','default_external_subtitle_lang','theme','gemini_model') and str(v) not in ('0','1'):raise ValidationError('Expected 0 or 1')
-                c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(k,str(v)))
+        for k,v in items.items():
+            if k=='poster_provider' and v not in ('commons','tmdb','none'):raise ValidationError('Unknown poster provider')
+            if k=='poster_provider' and v=='tmdb' and not self.tmdb_credentials.get():raise ValidationError('Connect TMDB in Settings before enabling it')
+            if k=='gemini_model':
+                if v and (not re.fullmatch(r'[A-Za-z0-9._-]{3,90}',str(v)) or str(v) not in GeminiClient(self.gemini_credentials.get()).models()):raise ValidationError('Select an available Gemini model')
+            elif k=='default_external_subtitle_lang' and str(v) not in ('Arabic','English','Unknown'):raise ValidationError('Invalid default subtitle language')
+            elif k=='theme' and str(v) not in ('dark','light','midnight'):raise ValidationError('Invalid interface theme')
+            elif k not in ('poster_provider','default_external_subtitle_lang','theme','gemini_model') and str(v) not in ('0','1'):raise ValidationError('Expected 0 or 1')
+        poster_guard=self._poster_state_lock if 'poster_provider' in items else nullcontext()
+        with poster_guard:
+            with self.connect() as c:
+                for k,v in items.items():c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(k,str(v)))
+            if 'poster_provider' in items:self._poster_policy_version+=1
         self.diagnostics.event('settings_changed',fields=','.join(sorted(items)))
         return self.settings()
     def gemini_status(self):
@@ -405,20 +428,26 @@ class Catalog:
             if suggestion['uncertain']:raise ValidationError('AI itself flagged this result as uncertain')
             status='verified';verified_id=imdb;tmdb_id=int(result['id'])
         except (TMDbError,ValidationError,ValueError,TypeError) as exc:extra=str(exc)[:150]
-        with self.connect() as c:
-            c.execute('INSERT OR REPLACE INTO ai_suggestions VALUES(?,?,?,?,?,?,?)',
-                      (mid,suggestion['title'],suggestion['year'],suggestion['imdb_id'],suggestion['reason']+' '+extra,status,time.strftime('%Y-%m-%dT%H:%M:%S%z')))
-            if status=='verified':
-                locks=set(movie['manual_fields']);fields={'tmdb_id':tmdb_id}
-                if 'display_title' not in locks:fields['display_title']=suggestion['title']
-                if 'year' not in locks and suggestion['year']:fields['year']=suggestion['year']
-                if 'imdb_id' not in locks:
-                    fields['imdb_id']=verified_id
-                    rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(verified_id,)).fetchone()
-                    fields['imdb_rating']=rating['rating'] if rating else None
-                    row=c.execute('SELECT genres FROM imdb_titles WHERE tconst=?',(verified_id,)).fetchone()
-                    if row and 'genres' not in locks:fields['genres']=row['genres']
-                c.execute('UPDATE movies SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',list(fields.values())+[mid])
+        with self._movie_lock(mid):
+            with self.connect() as c:
+                current=c.execute('SELECT * FROM movies WHERE id=?',(mid,)).fetchone()
+                if not current:raise ValidationError('Movie not found')
+                if (current['display_title'],current['year'],current['imdb_id'])!=(movie['display_title'],movie['year'],movie['imdb_id']):
+                    job['message']='AI result skipped because the movie identity was edited while verification was running.'
+                    return {'verified':False,'stale':True,'suggestion':suggestion,'imdb_id':'','reason':'movie identity changed'}
+                c.execute('INSERT OR REPLACE INTO ai_suggestions VALUES(?,?,?,?,?,?,?)',
+                          (mid,suggestion['title'],suggestion['year'],suggestion['imdb_id'],suggestion['reason']+' '+extra,status,time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                if status=='verified':
+                    locks=set(json.loads(current['manual_fields']));fields={'tmdb_id':tmdb_id}
+                    if 'display_title' not in locks:fields['display_title']=suggestion['title']
+                    if 'year' not in locks and suggestion['year']:fields['year']=suggestion['year']
+                    if 'imdb_id' not in locks:
+                        fields['imdb_id']=verified_id
+                        rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(verified_id,)).fetchone()
+                        fields['imdb_rating']=rating['rating'] if rating else None
+                        row=c.execute('SELECT genres FROM imdb_titles WHERE tconst=?',(verified_id,)).fetchone()
+                        if row and 'genres' not in locks:fields['genres']=row['genres']
+                    c.execute('UPDATE movies SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',list(fields.values())+[mid])
         job['message']='Gemini suggested a title; '+('independently verified by TMDB.' if status=='verified' else 'needs manual review.')
         return {'verified':status=='verified','suggestion':suggestion,'imdb_id':verified_id,'reason':extra}
     def resolve_ai(self,mid):return self.start_job('ai_identify',lambda job:self._resolve_ai_impl(job,int(mid)))
@@ -445,15 +474,19 @@ class Catalog:
             raise ValidationError('Enter the API Read Access Token from TMDB Settings')
         try:TMDbClient(token).test_connection()
         except TMDbError as e:raise ValidationError(str(e)) from None
-        self.tmdb_credentials.save(token)
-        with self.connect() as c:
-            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('poster_provider','tmdb')")
-            # Prior unsuccessful Wikimedia attempts should be eligible for TMDB retrieval.
-            c.execute("UPDATE movies SET poster_attempted_at='' WHERE (poster_path='' OR poster_path IS NULL) AND poster_locked=0")
+        with self._poster_state_lock:
+            self.tmdb_credentials.save(token)
+            with self.connect() as c:
+                c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('poster_provider','tmdb')")
+                # Prior unsuccessful Wikimedia attempts should be eligible for TMDB retrieval.
+                c.execute("UPDATE movies SET poster_attempted_at='' WHERE (poster_path='' OR poster_path IS NULL) AND poster_locked=0")
+            self._poster_policy_version+=1
         return self.tmdb_status()
     def disconnect_tmdb(self):
-        self.tmdb_credentials.clear()
-        with self.connect() as c:c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('poster_provider','commons')")
+        with self._poster_state_lock:
+            self.tmdb_credentials.clear()
+            with self.connect() as c:c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('poster_provider','commons')")
+            self._poster_policy_version+=1
         return self.tmdb_status()
     def roots(self):
         with self.connect() as c:return [dict(r) for r in c.execute('SELECT * FROM roots WHERE enabled=1 ORDER BY id DESC')]
@@ -464,6 +497,10 @@ class Catalog:
             c.execute("INSERT INTO roots(path,enabled,last_status) VALUES(?,1,'unscanned') ON CONFLICT(path) DO UPDATE SET enabled=1",(str(p),))
             return dict(c.execute('SELECT * FROM roots WHERE path=?',(str(p),)).fetchone())
     def disable_root(self,root_id:int):
+        # A scan owns the current root snapshot until it has reconciled missing
+        # entries. Disabling a root mid-scan would otherwise let that older
+        # snapshot write statuses after the user's newer action.
+        self._require_idle('Wait for the current library operation before disabling a source folder')
         with self.connect() as c:
             if not c.execute('SELECT 1 FROM roots WHERE id=?',(root_id,)).fetchone():raise ValidationError('Root not found')
             c.execute("UPDATE roots SET enabled=0,last_status='disabled' WHERE id=?",(root_id,))
@@ -534,37 +571,42 @@ class Catalog:
     def patch_movie(self,movie_id:int,values:dict):
         allowed={'display_title','year','genres','imdb_id','release_group','source','subtitle_source','translation_quality','notes','watched','poster_locked','favorite','personal_rating','playback_preference','preferred_subtitle_id'}
         if not values or set(values)-allowed:raise ValidationError('Unsupported edit field')
-        with self.connect() as c:
-            old=c.execute('SELECT * FROM movies WHERE id=?',(movie_id,)).fetchone()
-            if not old:raise ValidationError('Movie not found')
-            locks=set(json.loads(old['manual_fields']))
-            updates={}
-            for k,v in values.items():
-                if k=='imdb_id':
-                    v=str(v).strip()
-                    match=re.fullmatch(r'(?:https?://(?:www\.)?imdb\.com/title/)?(tt\d{5,12})/?',v)
-                    if v and not match:raise ValidationError('IMDb ID must resemble tt1234567 or a valid IMDb title URL')
-                    v=match.group(1) if match else ''
-                elif k=='year':v=clean_year(v)
-                elif k in ('watched','poster_locked','favorite'):v=int(bool(v))
-                elif k=='personal_rating':
-                    v=None if v in ('',None) else float(v)
-                    if v is not None and not 0<=v<=10:raise ValidationError('Personal rating must be 0–10')
-                elif k=='playback_preference':
-                    if v not in ('auto','ask','none','selected'):raise ValidationError('Unknown playback preference')
-                elif k=='preferred_subtitle_id':
-                    v=None if v in ('',None) else int(v)
-                    if v is not None and not c.execute('SELECT 1 FROM subtitles WHERE id=? AND movie_id=?',(v,movie_id)).fetchone():raise ValidationError('Selected subtitle does not belong to this movie')
-                elif k in ('display_title','genres','release_group','source','subtitle_source','translation_quality','notes'):
-                    v=str(v).strip()[:(4000 if k=='notes' else 180)]
-                    if k=='display_title' and not v:raise ValidationError('Movie title cannot be empty')
-                updates[k]=v;locks.add(k)
-            if 'imdb_id' in updates:
-                rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(updates['imdb_id'],)).fetchone() if updates['imdb_id'] else None
-                updates['imdb_rating']=rating['rating'] if rating else None
-            updates['manual_fields']=json.dumps(sorted(locks))
-            columns=','.join(f'{k}=?' for k in updates)
-            c.execute(f'UPDATE movies SET {columns} WHERE id=?',list(updates.values())+[movie_id])
+        poster_guard=self._poster_state_lock if 'poster_locked' in values else nullcontext()
+        with poster_guard:
+            with self._movie_lock(movie_id):
+                with self.connect() as c:
+                    old=c.execute('SELECT * FROM movies WHERE id=?',(movie_id,)).fetchone()
+                    if not old:raise ValidationError('Movie not found')
+                    locks=set(json.loads(old['manual_fields']))
+                    updates={}
+                    for k,v in values.items():
+                        if k=='imdb_id':
+                            v=str(v).strip()
+                            match=re.fullmatch(r'(?:https?://(?:www\.)?imdb\.com/title/)?(tt\d{5,12})/?',v)
+                            if v and not match:raise ValidationError('IMDb ID must resemble tt1234567 or a valid IMDb title URL')
+                            v=match.group(1) if match else ''
+                        elif k=='year':v=clean_year(v)
+                        elif k in ('watched','poster_locked','favorite'):v=int(bool(v))
+                        elif k=='personal_rating':
+                            v=None if v in ('',None) else float(v)
+                            if v is not None and not 0<=v<=10:raise ValidationError('Personal rating must be 0–10')
+                        elif k=='playback_preference':
+                            if v not in ('auto','ask','none','selected'):raise ValidationError('Unknown playback preference')
+                        elif k=='preferred_subtitle_id':
+                            v=None if v in ('',None) else int(v)
+                            if v is not None and not c.execute('SELECT 1 FROM subtitles WHERE id=? AND movie_id=?',(v,movie_id)).fetchone():raise ValidationError('Selected subtitle does not belong to this movie')
+                        elif k in ('display_title','genres','release_group','source','subtitle_source','translation_quality','notes'):
+                            v=str(v).strip()[:(4000 if k=='notes' else 180)]
+                            if k=='display_title' and not v:raise ValidationError('Movie title cannot be empty')
+                        updates[k]=v;locks.add(k)
+                    if 'imdb_id' in updates:
+                        rating=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(updates['imdb_id'],)).fetchone() if updates['imdb_id'] else None
+                        updates['imdb_rating']=rating['rating'] if rating else None
+                    updates['manual_fields']=json.dumps(sorted(locks))
+                    columns=','.join(f'{k}=?' for k in updates)
+                    c.execute(f'UPDATE movies SET {columns} WHERE id=?',list(updates.values())+[movie_id])
+                if 'poster_locked' in values:
+                    self._poster_versions[int(movie_id)]=self._poster_versions.get(int(movie_id),0)+1
         self.diagnostics.event('movie_metadata_changed',movie_id=movie_id,fields=','.join(sorted(values)))
         return self.movie(movie_id)
     def patch_subtitle(self,sub_id:int,values:dict):
@@ -573,9 +615,12 @@ class Catalog:
         if 'language' in vals:
             if vals['language'] not in ('Arabic','English','French','Spanish','German','Italian','Unknown','Other'):raise ValidationError('Unsupported subtitle language')
             vals['language_manual']=1
-        with self.connect() as c:
-            if not c.execute('SELECT 1 FROM subtitles WHERE id=?',(sub_id,)).fetchone():raise ValidationError('Subtitle not found')
-            c.execute('UPDATE subtitles SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[sub_id])
+        with self.connect() as c:row=c.execute('SELECT movie_id FROM subtitles WHERE id=?',(sub_id,)).fetchone()
+        if not row:raise ValidationError('Subtitle not found')
+        with self._movie_lock(row['movie_id']):
+            with self.connect() as c:
+                if not c.execute('SELECT 1 FROM subtitles WHERE id=? AND movie_id=?',(sub_id,row['movie_id'])).fetchone():raise ValidationError('Subtitle not found')
+                c.execute('UPDATE subtitles SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[sub_id])
         self.diagnostics.event('subtitle_metadata_changed',subtitle_id=sub_id,fields=','.join(sorted(values)))
     def detect_subtitles(self,fp:Path,raw:dict,all_movies:int)->list:
         result=[]
@@ -684,13 +729,14 @@ class Catalog:
                         if current.st_size!=st.st_size or current.st_mtime_ns!=st.st_mtime_ns:
                             raise OSError('Media changed during scan')
                         phase='metadata_refresh'
-                        with self.connect() as c:
-                            c.execute('UPDATE movies SET last_seen=? WHERE id=?',(now,old['id']))
-                            c.execute('UPDATE movies SET content_sha256=? WHERE id=?',(content_sha256,old['id']))
-                            # External subtitles and local poster.jpg can change even if video mtime is identical.
-                            cached_raw=json.loads(old['raw_probe'] or '{}')
-                            self._sync_subtitles(c,old['id'],self.detect_subtitles(fp,cached_raw,foldercounts[fp.parent]))
-                            unchanged_id=old['id']
+                        with self._movie_lock(old['id']):
+                            with self.connect() as c:
+                                c.execute('UPDATE movies SET last_seen=? WHERE id=?',(now,old['id']))
+                                c.execute('UPDATE movies SET content_sha256=? WHERE id=?',(content_sha256,old['id']))
+                                # External subtitles and local poster.jpg can change even if video mtime is identical.
+                                cached_raw=json.loads(old['raw_probe'] or '{}')
+                                self._sync_subtitles(c,old['id'],self.detect_subtitles(fp,cached_raw,foldercounts[fp.parent]))
+                                unchanged_id=old['id']
                     if unchanged_id is not None:
                         seen.append(unchanged_id);counts['unchanged']+=1;job['done']+=1
                         if self._local_poster(unchanged_id,fp,settings):counts['posters_found']+=1
@@ -712,26 +758,33 @@ class Catalog:
                             verified=[x for x in candidates if x['content_sha256'] and x['content_sha256']==content_sha256]
                             if len(verified)==1 and not (Path(verified[0]['candidate_root_path'])/verified[0]['relative_path']).is_file():
                                 old=verified[0]
-                        locks=set(json.loads(old['manual_fields'])) if old else set()
-                        fields={'root_id':rid,'relative_path':rel,'current_filename':fp.name,'last_seen':now,'modified_ns':st.st_mtime_ns,'fingerprint':fingerprint,'content_sha256':content_sha256,'status':'available',**tech}
-                        fields['raw_probe']=json.dumps(raw,ensure_ascii=False)
-                        if not old:
-                            fields.update({'original_filename':fp.name,'display_title':hints['title'],'year':hints['year'],'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag'],'added_at':now})
-                        else:
-                            for k,v in {'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag']}.items():
-                                if k not in locks:fields[k]=v
-                        if settings['auto_imdb']=='1':
-                            hit=self._match_imdb(c,fields.get('display_title',old['display_title'] if old else ''),fields.get('year',old['year'] if old else None))
-                            fields.update(self._imdb_identity_updates(c,old,hit,locks))
-                        if old:
-                            # If the original row was at a different path, reconcile without replacing immutable first filename.
-                            sql='UPDATE movies SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?'
-                            c.execute(sql,list(fields.values())+[old['id']]);mid=old['id'];counts['updated']+=1
-                        else:
-                            sql='INSERT INTO movies('+','.join(fields)+') VALUES('+','.join('?' for _ in fields)+')'
-                            mid=c.execute(sql,list(fields.values())).lastrowid;counts['added']+=1
-                        detected=self.detect_subtitles(fp,raw,foldercounts[fp.parent])
-                        self._sync_subtitles(c,mid,detected)
+                        with self._movie_lock(old['id']) if old else nullcontext():
+                            if old:
+                                # Re-read after acquiring the per-movie lock. A
+                                # user edit made while probing must be the basis
+                                # for manual-field protection at commit time.
+                                current_row=c.execute('SELECT * FROM movies WHERE id=?',(old['id'],)).fetchone()
+                                if current_row:old=current_row
+                            locks=set(json.loads(old['manual_fields'])) if old else set()
+                            fields={'root_id':rid,'relative_path':rel,'current_filename':fp.name,'last_seen':now,'modified_ns':st.st_mtime_ns,'fingerprint':fingerprint,'content_sha256':content_sha256,'status':'available',**tech}
+                            fields['raw_probe']=json.dumps(raw,ensure_ascii=False)
+                            if not old:
+                                fields.update({'original_filename':fp.name,'display_title':hints['title'],'year':hints['year'],'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag'],'added_at':now})
+                            else:
+                                for k,v in {'source':hints['source'],'release_group':hints['release_group'],'resolution_tag':tech['resolution_tag']}.items():
+                                    if k not in locks:fields[k]=v
+                            if settings['auto_imdb']=='1':
+                                hit=self._match_imdb(c,fields.get('display_title',old['display_title'] if old else ''),fields.get('year',old['year'] if old else None))
+                                fields.update(self._imdb_identity_updates(c,old,hit,locks))
+                            if old:
+                                # If the original row was at a different path, reconcile without replacing immutable first filename.
+                                sql='UPDATE movies SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?'
+                                c.execute(sql,list(fields.values())+[old['id']]);mid=old['id'];counts['updated']+=1
+                            else:
+                                sql='INSERT INTO movies('+','.join(fields)+') VALUES('+','.join('?' for _ in fields)+')'
+                                mid=c.execute(sql,list(fields.values())).lastrowid;counts['added']+=1
+                            detected=self.detect_subtitles(fp,raw,foldercounts[fp.parent])
+                            self._sync_subtitles(c,mid,detected)
                     seen.append(mid);job['done']+=1
                     if self._local_poster(mid,fp,settings):counts['posters_found']+=1
                     # Network artwork fetch is a separate job by design: scans should work offline and be responsive.
@@ -757,16 +810,19 @@ class Catalog:
         return counts
     def _refresh_local_metadata(self,job):
         matched=ratings=0
-        with self.connect() as c:
-            rows=c.execute('SELECT id,display_title,year,imdb_id,imdb_rating,manual_fields FROM movies').fetchall()
-            for r in rows:
-                if job.get('cancel'):break
-                locks=set(json.loads(r['manual_fields']))
-                hit=self._match_imdb(c,r['display_title'],r['year'])
-                changes=self._imdb_identity_updates(c,r,hit,locks)
-                if 'imdb_id' in changes:matched+=1
-                if changes.get('imdb_rating') is not None:ratings+=1
-                if changes:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in changes)+' WHERE id=?',list(changes.values())+[r['id']])
+        with self.connect() as c:ids=[r['id'] for r in c.execute('SELECT id FROM movies')]
+        for mid in ids:
+            if job.get('cancel'):break
+            with self._movie_lock(mid):
+                with self.connect() as c:
+                    r=c.execute('SELECT * FROM movies WHERE id=?',(mid,)).fetchone()
+                    if not r:continue
+                    locks=set(json.loads(r['manual_fields']))
+                    hit=self._match_imdb(c,r['display_title'],r['year'])
+                    changes=self._imdb_identity_updates(c,r,hit,locks)
+                    if 'imdb_id' in changes:matched+=1
+                    if changes.get('imdb_rating') is not None:ratings+=1
+                    if changes:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in changes)+' WHERE id=?',list(changes.values())+[mid])
         return {'local_title_matches':matched,'ratings_refreshed':ratings}
     def _smart_update_impl(self,job,mode,include_gemini=False,limit=100):
         if mode not in ('quick','metadata','posters','full'):raise ValidationError('Unknown update mode')
@@ -812,7 +868,7 @@ class Catalog:
     def scan(self,root_ids=None):return self.start_job('scan',lambda j:self._scan_impl(j,root_ids))
     def start_job(self,kind,fn):
         with self.job_lock:
-            if self.active_job and self.jobs.get(self.active_job,{}).get('state')=='running':raise BusyError('Another library operation is running')
+            if self._active_job_unlocked():raise BusyError('Another library operation is running')
             if len(self.jobs)>70:
                 finished=sorted((v for v in self.jobs.values() if v['state']!='running'),key=lambda x:x.get('finished',0))
                 for old in finished[:len(self.jobs)-60]:self.jobs.pop(old['id'],None)
@@ -828,41 +884,121 @@ class Catalog:
             except Exception as exc:
                 outcome='failed';job['message']=f'{type(exc).__name__}: {exc}'
             finally:
-                # Log before making completion visible to other threads/tests.
-                # Diagnostics must not be allowed to crash the background worker.
+                # Publish completion and release the exclusive slot together.
+                # An older worker must never clear a newer job's active marker.
+                with self.job_lock:
+                    if outcome=='completed' and job.get('cancel') and not job.get('commit_completed'):
+                        outcome='cancelled'
+                    job['finished']=time.time();job['state']=outcome
+                    if self.active_job==job_id:self.active_job=None
                 try:self.diagnostics.event('background_job_finished',kind=kind,state=outcome,job_id=job_id,done=job['done'])
                 except OSError:pass
-                job['finished']=time.time();job['state']=outcome
                 # Queue online poster work separately, after file scanning has finished.
                 if kind=='scan' and outcome=='completed' and self.settings()['auto_posters']=='1':
                     try:self.fetch_missing_posters(10)
                     except (BusyError,OSError):pass
         threading.Thread(target=run,daemon=True,name='mv-'+kind).start();return job_id
-    def job(self,job_id):return dict(self.jobs.get(str(job_id),{'state':'not_found'}))
+    def job(self,job_id):
+        with self.job_lock:return dict(self.jobs.get(str(job_id),{'state':'not_found'}))
     def _poster_image(self,source,dest:Path):
-        # PIL validates file contents; transcode to a single format. Reject decompression bombs.
+        """Validate and encode to a unique private temporary file.
+
+        Callers publish the result only while holding the poster commit locks.
+        Unique names avoid two writers sharing the old ``.partial`` path.
+        """
         Image.MAX_IMAGE_PIXELS=35_000_000
-        with Image.open(source) as im:
-            im.load();im=ImageOps.exif_transpose(im).convert('RGB');im.thumbnail((1000,1500),Image.Resampling.LANCZOS)
-            temp=dest.with_suffix('.partial');im.save(temp,'JPEG',quality=88,optimize=True);os.replace(temp,dest)
+        fd,name=tempfile.mkstemp(prefix=f'.{dest.stem}-',suffix='.partial',dir=dest.parent)
+        os.close(fd);temp=Path(name)
+        try:
+            with Image.open(source) as im:
+                im.load();im=ImageOps.exif_transpose(im).convert('RGB');im.thumbnail((1000,1500),Image.Resampling.LANCZOS)
+                im.save(temp,'JPEG',quality=88,optimize=True)
+            return temp
+        except Exception:
+            temp.unlink(missing_ok=True);raise
+    def _commit_poster(self,mid:int,temp:Path,source:str,credit:str='',expected_version=None,automatic=False):
+        dst=self.posters/f'{mid}.jpg';movie_lock=self._movie_lock(mid)
+        with self._poster_state_lock:
+            with movie_lock:
+                current_version=self._poster_versions.get(int(mid),0)
+                current_token=(current_version,self._poster_policy_version)
+                with self.connect() as c:
+                    row=c.execute('SELECT poster_locked FROM movies WHERE id=?',(mid,)).fetchone()
+                if not row:raise ValidationError('Movie not found')
+                if expected_version is not None and current_token!=expected_version:
+                    raise ValidationError('Poster changed while artwork was being prepared; the newer choice was kept')
+                if automatic and row['poster_locked']:
+                    raise ValidationError('Poster locked by user')
+                previous=None
+                if dst.is_file() and not dst.is_symlink():
+                    try:previous=dst.read_bytes()
+                    except OSError:previous=None
+                published=False
+                try:
+                    os.replace(temp,dst);published=True
+                    with self.connect() as c:
+                        result=c.execute('UPDATE movies SET poster_path=?,poster_source=?,poster_credit=?,poster_locked=?,poster_attempted_at=? WHERE id=?',
+                                         (f'posters/{mid}.jpg',source,credit,1 if source in ('manual upload','Custom Frame') else 0,time.strftime('%Y-%m-%dT%H:%M:%S%z'),mid))
+                        if result.rowcount!=1:raise ValidationError('Movie not found')
+                    self._poster_versions[int(mid)]=current_version+1
+                    return current_version+1
+                except Exception:
+                    if published:
+                        if previous is None:dst.unlink(missing_ok=True)
+                        else:
+                            fd,name=tempfile.mkstemp(prefix=f'.{mid}-rollback-',suffix='.jpg',dir=self.posters)
+                            try:
+                                with os.fdopen(fd,'wb') as output:output.write(previous)
+                                os.replace(name,dst)
+                            finally:Path(name).unlink(missing_ok=True)
+                    raise
+    def clear_poster(self,mid:int,expected_source=None):
+        """Clear one managed poster while invalidating in-flight producers."""
+        dst=self.posters/f'{mid}.jpg';movie_lock=self._movie_lock(mid)
+        with self._poster_state_lock:
+            with movie_lock:
+                with self.connect() as c:
+                    row=c.execute('SELECT poster_source FROM movies WHERE id=?',(mid,)).fetchone()
+                if not row:raise ValidationError('Movie not found')
+                if expected_source is not None and row['poster_source']!=expected_source:return False
+                tombstone=None
+                if os.path.lexists(dst):
+                    fd,name=tempfile.mkstemp(prefix=f'.{mid}-clear-',suffix='.jpg',dir=self.posters)
+                    os.close(fd);Path(name).unlink(missing_ok=True);tombstone=Path(name)
+                    os.replace(dst,tombstone)
+                try:
+                    with self.connect() as c:
+                        c.execute("UPDATE movies SET poster_path='',poster_source='',poster_credit='',poster_locked=0,poster_attempted_at='' WHERE id=?",(mid,))
+                    self._poster_versions[int(mid)]=self._poster_versions.get(int(mid),0)+1
+                except Exception:
+                    if tombstone and os.path.lexists(tombstone):os.replace(tombstone,dst)
+                    raise
+                finally:
+                    if tombstone:tombstone.unlink(missing_ok=True)
+                return True
     def _local_poster(self,mid:int,fp:Path,settings:dict):
-        with self.connect() as c:r=c.execute('SELECT poster_locked,poster_path FROM movies WHERE id=?',(mid,)).fetchone()
-        if not r or r['poster_locked']:return False
-        if r['poster_path'] and (self.dir/r['poster_path']).is_file():return False
+        try:version,movie=self._poster_context(mid)
+        except ValidationError:return False
+        if movie['poster_locked']:return False
+        if movie['poster_path'] and (self.dir/movie['poster_path']).is_file():return False
         available={p.name.lower():p for p in fp.parent.iterdir() if p.is_file() and not p.is_symlink()}
         candidate=next((available[x] for x in POSTER_NAMES if x in available),None)
         if not candidate:return False
         dst=self.posters/f'{mid}.jpg'
-        try:self._poster_image(candidate,dst)
+        try:
+            temp=self._poster_image(candidate,dst)
+            try:self._commit_poster(mid,temp,'local file',expected_version=version,automatic=True)
+            finally:temp.unlink(missing_ok=True)
         except (OSError,ValueError,UnidentifiedImageError,Image.DecompressionBombError):return False
-        with self.connect() as c:c.execute('UPDATE movies SET poster_path=?,poster_source=? WHERE id=?',(f'posters/{mid}.jpg','local file',mid))
+        except ValidationError:return False
         return True
-    def set_poster(self,mid:int,body:bytes,source='manual upload',credit=''):
+    def set_poster(self,mid:int,body:bytes,source='manual upload',credit='',expected_version=None,automatic=False):
         if len(body)>12_000_000 or not body:raise ValidationError('Poster must be a nonempty image under 12 MB')
         movie=self.movie(mid);dst=self.posters/f'{mid}.jpg'
-        try:self._poster_image(io.BytesIO(body),dst)
+        try:temp=self._poster_image(io.BytesIO(body),dst)
         except (OSError,ValueError,UnidentifiedImageError,Image.DecompressionBombError) as e:raise ValidationError('Not a supported image') from e
-        with self.connect() as c:c.execute('UPDATE movies SET poster_path=?,poster_source=?,poster_credit=?,poster_locked=?,poster_attempted_at=? WHERE id=?',(f'posters/{mid}.jpg',source,credit,1 if source in ('manual upload','Custom Frame') else 0,time.strftime('%Y-%m-%dT%H:%M:%S%z'),mid))
+        try:self._commit_poster(mid,temp,source,credit,expected_version=expected_version,automatic=automatic)
+        finally:temp.unlink(missing_ok=True)
         if self.settings()['poster_in_folder']=='1' and movie['status']=='available' and source!='TMDb':
             try:
                 folder=Path(movie['path']).parent;local=folder/'poster.jpg'
@@ -873,7 +1009,7 @@ class Catalog:
                     shutil.copyfileobj(source_file,output)
             except OSError:pass # cache always survives inaccessible/read-only movie folders
     def _frame_poster_impl(self,job,mid):
-        movie=self.movie(mid)
+        version,movie=self._poster_context(mid)
         if movie['status']!='available' or not Path(movie['path']).is_file():raise ValidationError('Movie file is not available for generating a custom poster')
         if movie['poster_locked']:raise ValidationError('Unlock the existing manually selected poster before generating a replacement')
         executable=find_ffmpeg()
@@ -915,12 +1051,12 @@ class Catalog:
             draw.text((375,min(970,y+35)),label,fill='#efc981',font=small,anchor='mt')
             draw.text((375,1074),'CUSTOM FRAME POSTER · NOT OFFICIAL ARTWORK',fill='#a9b4bf',font=small,anchor='mt')
             blob=io.BytesIO();canvas.save(blob,'JPEG',quality=89,optimize=True)
-        self.set_poster(mid,blob.getvalue(),source='Custom Frame',credit='Generated locally from a frame of the user-provided video')
+        self.set_poster(mid,blob.getvalue(),source='Custom Frame',credit='Generated locally from a frame of the user-provided video',expected_version=version)
         job['message']='Custom poster generated locally without modifying movie or subtitle files.'
         return {'movie_id':mid,'source':'Custom Frame'}
     def generate_frame_poster(self,mid):return self.start_job('frame_poster',lambda job:self._frame_poster_impl(job,int(mid)))
     def _commons_poster(self,mid,job,replace=False):
-        movie=self.movie(mid)
+        version,movie=self._poster_context(mid)
         if movie['poster_locked']:raise ValidationError('Poster locked by user')
         if not replace and movie['poster_path'] and (self.dir/movie['poster_path']).exists():raise ValidationError('Poster already exists. Use Refresh Poster Online to replace an unlocked automatic poster.')
         title=movie['display_title'];year=movie['year'];term=f'"{title}" film poster'+(f' {year}' if year else '')
@@ -953,10 +1089,10 @@ class Catalog:
             if not mime.startswith('image/'):raise ValidationError('Artwork source returned a non-image')
             raw=response.read(12_000_001)
         if len(raw)>12_000_000:raise ValidationError('Poster exceeds limit')
-        self.set_poster(mid,raw,source='Wikimedia Commons',credit=f'{file_title} | Author: {artist or "see source"} | {license_short} | {source_url}')
+        self.set_poster(mid,raw,source='Wikimedia Commons',credit=f'{file_title} | Author: {artist or "see source"} | {license_short} | {source_url}',expected_version=version,automatic=True)
         return {'provider':'Wikimedia Commons','attribution':file_title,'license':license_short,'source_url':source_url}
     def _tmdb_poster(self,mid,job,replace=False):
-        movie=self.movie(mid)
+        version,movie=self._poster_context(mid)
         if movie['poster_locked']:raise ValidationError('Poster locked by user')
         if not replace and movie['poster_path'] and (self.dir/movie['poster_path']).is_file():
             raise ValidationError('Poster already exists. Refresh only unlocked automatic artwork.')
@@ -966,7 +1102,7 @@ class Catalog:
         if not pic:raise ValidationError('TMDB matched this film, but has no poster.')
         blob=client.download_poster(pic)
         tmdb_id=match.get('id')
-        self.set_poster(mid,blob,source='TMDb',credit=f'TMDb / movie/{tmdb_id} / matched by {match_method}')
+        self.set_poster(mid,blob,source='TMDb',credit=f'TMDb / movie/{tmdb_id} / matched by {match_method}',expected_version=version,automatic=True)
         # TMDB images are held in the managed cache, rather than silently copied into
         # permanent user movie directories. The cache is subject to TMDB retention rules.
         return {'provider':'TMDb','tmdb_id':tmdb_id,'method':match_method}
@@ -994,18 +1130,24 @@ class Catalog:
         external=details.get('external_ids') or {}
         ext_imdb=external.get('imdb_id') or details.get('imdb_id') or ''
         if ext_imdb and not re.fullmatch(r'tt\d{5,12}',ext_imdb):ext_imdb=''
-        with self.connect() as c:
-            locks=set(movie['manual_fields'])
-            updates={'tmdb_id':int(matched['id']),'overview':str(details.get('overview') or '')[:3000],
-                     'cast_names':', '.join(cast)[:1500], 'tmdb_metadata_at':time.strftime('%Y-%m-%dT%H:%M:%S%z')}
-            rating=details.get('vote_average')
-            updates['tmdb_rating']=float(rating) if isinstance(rating,(int,float)) and 0<=rating<=10 else None
-            if ext_imdb and 'imdb_id' not in locks and not movie.get('imdb_id'):
-                updates['imdb_id']=ext_imdb
-            rating_id=movie.get('imdb_id','') or (ext_imdb if 'imdb_id' not in locks else '')
-            ratingrow=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(rating_id,)).fetchone() if rating_id else None
-            updates['imdb_rating']=ratingrow['rating'] if ratingrow else None
-            c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
+        with self._movie_lock(mid):
+            with self.connect() as c:
+                current=c.execute('SELECT * FROM movies WHERE id=?',(mid,)).fetchone()
+                if not current:raise ValidationError('Movie not found')
+                if (current['display_title'],current['year'],current['imdb_id'])!=(movie['display_title'],movie['year'],movie['imdb_id']):
+                    job['message']='Provider metadata skipped because the movie identity was edited while the request was running.'
+                    return {'movie_id':mid,'stale':True,'matched_by':method}
+                locks=set(json.loads(current['manual_fields']))
+                updates={'tmdb_id':int(matched['id']),'overview':str(details.get('overview') or '')[:3000],
+                         'cast_names':', '.join(cast)[:1500], 'tmdb_metadata_at':time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+                rating=details.get('vote_average')
+                updates['tmdb_rating']=float(rating) if isinstance(rating,(int,float)) and 0<=rating<=10 else None
+                if ext_imdb and 'imdb_id' not in locks and not current['imdb_id']:
+                    updates['imdb_id']=ext_imdb
+                rating_id=current['imdb_id'] or (ext_imdb if 'imdb_id' not in locks else '')
+                ratingrow=c.execute('SELECT rating FROM imdb_ratings WHERE tconst=?',(rating_id,)).fetchone() if rating_id else None
+                updates['imdb_rating']=ratingrow['rating'] if ratingrow else None
+                c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
         job['message']='Movie cast, overview and verified metadata refreshed.'
         return {'movie_id':mid,'cast_count':len(cast),'matched_by':method}
     def refresh_movie_details(self,mid):return self.start_job('movie_details',lambda job:self._refresh_movie_details_impl(job,int(mid)))
@@ -1027,12 +1169,19 @@ class Catalog:
         counts={'matched':0,'not_found':0,'attempted':len(mids)};job['total']=len(mids)
         for mid in mids:
             if job.get('cancel'):break
+            attempt_token,_=self._poster_context(mid)
             job['message']=f'Checking reusable artwork for film {job["done"]+1}/{job["total"]}'
             try:self._online_poster(mid,job);counts['matched']+=1
             except (ValidationError,OSError,ValueError,TimeoutError,urllib.error.URLError) as e:
                 counts['not_found']+=1;job['message']=str(e)[:120]
             finally:
-                with self.connect() as c:c.execute('UPDATE movies SET poster_attempted_at=? WHERE id=?',(time.strftime('%Y-%m-%dT%H:%M:%S%z'),mid))
+                # Do not let an older batch touch the state of a newer manual
+                # poster decision.
+                with self._poster_state_lock:
+                    with self._movie_lock(mid):
+                        current_token=(self._poster_versions.get(int(mid),0),self._poster_policy_version)
+                        if current_token==attempt_token:
+                            with self.connect() as c:c.execute('UPDATE movies SET poster_attempted_at=? WHERE id=? AND poster_locked=0',(time.strftime('%Y-%m-%dT%H:%M:%S%z'),mid))
                 job['done']+=1
             time.sleep(.35)
         job['message']=f'Artwork batch completed: {counts["matched"]} found, {counts["not_found"]} unavailable (can be set manually).';return counts
@@ -1049,15 +1198,18 @@ class Catalog:
         except OSError:return None
     def _enrich_existing_movies(self,job):
         matches=0
-        with self.connect() as c:
-            # Existing unchanged films are enriched immediately after IMDb import.
-            rows=c.execute('SELECT id,display_title,year,imdb_id,imdb_rating,manual_fields FROM movies').fetchall()
-            for r in rows:
-                if job.get('cancel'):break
-                hit=self._match_imdb(c,r['display_title'],r['year'])
-                locks=set(json.loads(r['manual_fields']));vals=self._imdb_identity_updates(c,r,hit,locks)
-                if vals:
-                    c.execute('UPDATE movies SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[r['id']]);matches+=1
+        with self.connect() as c:ids=[r['id'] for r in c.execute('SELECT id FROM movies')]
+        # Existing unchanged films are enriched immediately after IMDb import.
+        for mid in ids:
+            if job.get('cancel'):break
+            with self._movie_lock(mid):
+                with self.connect() as c:
+                    r=c.execute('SELECT * FROM movies WHERE id=?',(mid,)).fetchone()
+                    if not r:continue
+                    hit=self._match_imdb(c,r['display_title'],r['year'])
+                    locks=set(json.loads(r['manual_fields']));vals=self._imdb_identity_updates(c,r,hit,locks)
+                    if vals:
+                        c.execute('UPDATE movies SET '+','.join(k+'=?' for k in vals)+' WHERE id=?',list(vals.values())+[mid]);matches+=1
         job['message']=f'IMDb imported; {matches} existing movie records enriched.'
         return matches
     def download_imdb(self):
@@ -1209,14 +1361,23 @@ class Catalog:
     def download_imdb_ratings(self):return self.start_job('imdb_ratings_download',self._download_imdb_ratings_impl)
     def import_imdb(self,path):return self.start_job('imdb_import',lambda j:self._imdb_import_impl(j,path))
     def match_imdb(self,mid):
-        movie=self.movie(mid)
-        with self.connect() as c:
-            hit=self._match_imdb(c,movie['display_title'],movie['year'])
-            if not hit:return {'matched':False}
-            locks=set(movie['manual_fields']);updates=self._imdb_identity_updates(c,movie,hit,locks)
-            if updates:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
-            return {'matched':True,'imdb_id':updates.get('imdb_id') or movie.get('imdb_id',''),'candidate_imdb_id':hit['tconst'],'updates':updates}
+        with self._movie_lock(mid):
+            movie=self.movie(mid)
+            with self.connect() as c:
+                hit=self._match_imdb(c,movie['display_title'],movie['year'])
+                if not hit:return {'matched':False}
+                locks=set(movie['manual_fields']);updates=self._imdb_identity_updates(c,movie,hit,locks)
+                if updates:c.execute('UPDATE movies SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',list(updates.values())+[mid])
+                return {'matched':True,'imdb_id':updates.get('imdb_id') or movie.get('imdb_id',''),'candidate_imdb_id':hit['tconst'],'updates':updates}
     def backup(self,target=None):
+        # A backup must snapshot poster metadata and copy the corresponding
+        # generation of managed files. Reject only while a poster commit is in
+        # its short unsafe section; otherwise hold the guard through the copy.
+        if not self._poster_state_lock.acquire(blocking=False):
+            raise BusyError('Poster artwork is being updated; retry the backup')
+        try:return self._backup_locked(target)
+        finally:self._poster_state_lock.release()
+    def _backup_locked(self,target=None):
         dst=Path(target).expanduser().resolve() if target else self.backups/('MovieVault_Backup_'+time.strftime('%Y%m%d_%H%M%S')+'.zip')
         if dst.suffix.lower()!='.zip':raise ValidationError('Backup must have .zip extension')
         if not dst.parent.is_dir():raise ValidationError('Backup destination folder does not exist')
@@ -1233,8 +1394,8 @@ class Catalog:
                     z.write(snap,'movievault.sqlite')
                     manifest={'product':'MovieVault','version':VERSION,'schema':SCHEMA_VERSION,'created':time.strftime('%Y-%m-%dT%H:%M:%S%z')}
                     z.writestr('manifest.json',json.dumps(manifest))
-                    with self.connect() as dbcon:
-                        tmdb_ids={r['id'] for r in dbcon.execute("SELECT id FROM movies WHERE poster_source='TMDb'")}
+                    with sqlite3.connect(str(snap)) as dbcon:
+                        tmdb_ids={r[0] for r in dbcon.execute("SELECT id FROM movies WHERE poster_source='TMDb'")}
                     for f in self.posters.glob('*.jpg'):
                         # TMDB licensed artwork is a time-limited cache, not permanent portable content.
                         if f.stem.isdigit() and int(f.stem) in tmdb_ids:continue
@@ -1326,6 +1487,9 @@ class Catalog:
         _validate_restore_database(database,SCHEMA_VERSION)
         return database
     def _activate_restore_archive(self,pending:Path,manifest:dict):
+        self._require_idle('Wait for the current library operation before activating a restore')
+        with self._poster_state_lock:return self._activate_restore_archive_locked(pending,manifest)
+    def _activate_restore_archive_locked(self,pending:Path,manifest:dict):
         with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
             staged=Path(td)/'staged';staged.mkdir()
             candidate=self._extract_restore_archive(pending,staged,manifest)
