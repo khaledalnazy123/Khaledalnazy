@@ -17,6 +17,11 @@ POSTER_NAMES = ('poster.jpg','poster.jpeg','poster.png','folder.jpg','folder.png
 GROUPS = ('YTS','YIFY','RARBG','QXR','PSA','EVO','FGT','SPARKS','FLUX','NTB','AMZN','Tigole','Joy','MZABI','GalaxyRG','MeGusta','ION10','CtrlHD','DON','EPSiLON','RZE','HDS')
 LANGS = {'ar':'Arabic','ara':'Arabic','arabic':'Arabic','en':'English','eng':'English','english':'English','fr':'French','fre':'French','fra':'French','es':'Spanish','spa':'Spanish','de':'German','ger':'German','it':'Italian'}
 SCHEMA_VERSION = 3
+BACKUP_MAX_ARCHIVE_BYTES = 1_200_000_000
+BACKUP_MAX_UNCOMPRESSED_BYTES = 1_200_000_000
+BACKUP_MAX_DATABASE_BYTES = 1_000_000_000
+BACKUP_MAX_POSTER_BYTES = 12_000_000
+BACKUP_REQUIRED_TABLES = frozenset({'meta','roots','movies','subtitles','settings','imdb_titles'})
 
 def normalize(v: str) -> str:
     v = unicodedata.normalize('NFKD', v or '').casefold()
@@ -129,6 +134,38 @@ def default_data_dir() -> Path:
 class BusyError(Exception):pass
 class ValidationError(Exception):pass
 
+def _copy_limited(source,destination,max_bytes:int) -> int:
+    total=0
+    while True:
+        chunk=source.read(min(1024*1024,max_bytes-total+1))
+        if not chunk:break
+        total+=len(chunk)
+        if total>max_bytes:raise ValidationError('Backup content exceeds safety limit')
+        destination.write(chunk)
+    return total
+
+def _validate_restore_database(path:Path,manifest_schema:int) -> None:
+    try:
+        uri=f'{path.resolve().as_uri()}?mode=ro'
+        db=sqlite3.connect(uri,uri=True,timeout=15)
+        try:
+            db.execute('PRAGMA query_only=ON')
+            db.execute('PRAGMA trusted_schema=OFF')
+            integrity=[r[0] for r in db.execute('PRAGMA integrity_check').fetchall()]
+            if integrity!=['ok']:raise ValidationError('Backup database failed integrity check')
+            tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not BACKUP_REQUIRED_TABLES <= tables:raise ValidationError('Backup database is missing required tables')
+            row=db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if not row:raise ValidationError('Backup database has no schema version')
+            db_schema=int(row[0])
+            if not 1<=db_schema<=SCHEMA_VERSION or db_schema!=manifest_schema:
+                raise ValidationError('Backup database schema does not match its manifest')
+        finally:
+            db.close()
+    except ValidationError:raise
+    except (sqlite3.DatabaseError,ValueError,OSError) as exc:
+        raise ValidationError('Backup database is corrupt or unreadable') from exc
+
 class Catalog:
     def __init__(self,data_dir:Path|str|None=None):
         self.dir=Path(data_dir or default_data_dir());self.dir.mkdir(parents=True,exist_ok=True)
@@ -140,6 +177,13 @@ class Catalog:
         self.diagnostics=Diagnostics(self.dir)
         self.job_lock=threading.Lock();self.jobs={};self.active_job=None
         self.initialize()
+        # Older v2 builds could activate a v1 snapshot before removing arbitrary
+        # legacy settings. Clean only catalogs marked as v1 imports, once, before
+        # any API response or backup can expose/copy those rows.
+        from mv_migration import cleanup_migrated_v2_database
+        removed_legacy_settings=cleanup_migrated_v2_database(self.db)
+        if removed_legacy_settings:
+            self.diagnostics.event('legacy_settings_sanitized',removed_count=removed_legacy_settings)
         self.expire_tmdb_artwork()
         self.expire_tmdb_details()
         self.diagnostics.event('app_initialized',schema=SCHEMA_VERSION)
@@ -1067,47 +1111,118 @@ class Catalog:
         return str(dst)
     def validate_backup(self,path):
         src=Path(path).expanduser().resolve()
-        if not src.is_file():raise ValidationError('Backup file not found')
-        with zipfile.ZipFile(src) as z:
-            files=z.infolist();names={f.filename for f in files}
-            if 'manifest.json' not in names or 'movievault.sqlite' not in names:raise ValidationError('Not a MovieVault backup')
-            if len(files)>50000 or sum(f.file_size for f in files)>1_200_000_000:raise ValidationError('Backup exceeds safety limit')
-            if any(f.filename=='movievault.sqlite' and f.file_size>1_000_000_000 for f in files):raise ValidationError('Database exceeds backup safety limit')
-            for f in files:
-                if f.filename not in ('manifest.json','movievault.sqlite') and not re.fullmatch(r'posters/\d+\.jpg',f.filename):raise ValidationError('Unexpected archive member')
-                if f.is_dir() or (f.external_attr >> 16)&0o170000==0o120000:raise ValidationError('Unsafe backup member')
-            manifest=json.loads(z.read('manifest.json'))
-            if manifest.get('product')!='MovieVault' or int(manifest.get('schema',999))>SCHEMA_VERSION:raise ValidationError('Unsupported or newer backup version')
+        if not src.is_file() or src.is_symlink():raise ValidationError('Backup file not found')
+        if src.stat().st_size>BACKUP_MAX_ARCHIVE_BYTES:raise ValidationError('Backup archive exceeds safety limit')
+        try:
+            with zipfile.ZipFile(src) as z:
+                files=z.infolist();names=[f.filename for f in files];name_set=set(names)
+                if len(names)!=len(name_set):raise ValidationError('Backup contains duplicate archive members')
+                if 'manifest.json' not in name_set or 'movievault.sqlite' not in name_set:raise ValidationError('Not a MovieVault backup')
+                if len(files)>50000 or sum(f.file_size for f in files)>BACKUP_MAX_UNCOMPRESSED_BYTES:raise ValidationError('Backup exceeds safety limit')
+                for info in files:
+                    if info.filename not in ('manifest.json','movievault.sqlite') and not re.fullmatch(r'posters/\d+\.jpg',info.filename):raise ValidationError('Unexpected archive member')
+                    if info.is_dir() or ((info.external_attr >> 16)&0o170000)==0o120000:raise ValidationError('Unsafe backup member')
+                    if info.filename=='movievault.sqlite' and info.file_size>BACKUP_MAX_DATABASE_BYTES:raise ValidationError('Database exceeds backup safety limit')
+                    if info.filename.startswith('posters/') and info.file_size>BACKUP_MAX_POSTER_BYTES:raise ValidationError('Poster exceeds backup safety limit')
+                    if info.compress_size and info.file_size>10_000_000 and info.file_size/max(1,info.compress_size)>400:
+                        raise ValidationError('Suspicious ZIP compression ratio')
+                manifest_info=z.getinfo('manifest.json')
+                if manifest_info.file_size>1_000_000:raise ValidationError('Backup manifest exceeds safety limit')
+                manifest=json.loads(z.read(manifest_info))
+                schema=int(manifest.get('schema',999))
+                if manifest.get('product')!='MovieVault' or not 1<=schema<=SCHEMA_VERSION:
+                    raise ValidationError('Unsupported or newer backup version')
+                if z.testzip() is not None:raise ValidationError('Backup failed CRC validation')
+                with tempfile.TemporaryDirectory(prefix='mv-backup-validate-') as td:
+                    candidate=Path(td)/'movievault.sqlite'
+                    with z.open('movievault.sqlite') as source,candidate.open('wb') as destination:
+                        copied=_copy_limited(source,destination,BACKUP_MAX_DATABASE_BYTES)
+                    if copied!=z.getinfo('movievault.sqlite').file_size:raise ValidationError('Backup database size is inconsistent')
+                    _validate_restore_database(candidate,schema)
+        except ValidationError:raise
+        except (zipfile.BadZipFile,zipfile.LargeZipFile,RuntimeError,ValueError,TypeError,KeyError,OSError) as exc:
+            raise ValidationError('Backup archive is corrupt or unreadable') from exc
         return {'source':str(src),'manifest':manifest}
     def stage_restore(self,path):
-        info=self.validate_backup(path);dest=self.dir/'restore_pending.zip';part=self.dir/'restore_pending.partial'
-        shutil.copyfile(info['source'],part);os.replace(part,dest)
-        return 'Backup validated and staged. Restart MovieVault to restore; a safety backup is created first.'
+        src=Path(path).expanduser().resolve();dest=self.dir/'restore_pending.zip';part=self.dir/'restore_pending.partial'
+        if not src.is_file() or src.is_symlink():raise ValidationError('Backup file not found')
+        part.unlink(missing_ok=True)
+        try:
+            with src.open('rb') as source,part.open('wb') as destination:
+                _copy_limited(source,destination,BACKUP_MAX_ARCHIVE_BYTES)
+            # Validate the exact private copy that will be activated, closing the
+            # source-to-stage race and keeping invalid data out of restore_pending.
+            self.validate_backup(part)
+            os.replace(part,dest)
+        finally:part.unlink(missing_ok=True)
+        return 'Backup fully validated and staged. Restart MovieVault to restore; a safety backup is created first.'
+    def _extract_restore_archive(self,pending:Path,destination:Path,manifest:dict):
+        with zipfile.ZipFile(pending) as z:
+            database=destination/'movievault.sqlite'
+            with z.open('movievault.sqlite') as source,database.open('wb') as output:
+                copied=_copy_limited(source,output,BACKUP_MAX_DATABASE_BYTES)
+            if copied!=z.getinfo('movievault.sqlite').file_size:raise ValidationError('Backup database size is inconsistent')
+            for info in z.infolist():
+                if not re.fullmatch(r'posters/\d+\.jpg',info.filename):continue
+                target=destination/info.filename;target.parent.mkdir(exist_ok=True)
+                with z.open(info) as source,target.open('wb') as output:
+                    copied=_copy_limited(source,output,BACKUP_MAX_POSTER_BYTES)
+                if copied!=info.file_size:raise ValidationError('Backup poster size is inconsistent')
+        _validate_restore_database(database,int(manifest['schema']))
+        return database
+    def _activate_restore_archive(self,pending:Path,manifest:dict):
+        with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
+            staged=Path(td)/'staged';staged.mkdir()
+            candidate=self._extract_restore_archive(pending,staged,manifest)
+            rollback=Path(td)/'live_before_restore.sqlite'
+            with self.connect() as current:
+                snapshot=sqlite3.connect(str(rollback))
+                try:current.backup(snapshot)
+                finally:snapshot.close()
+            old_posters=self.dir/('posters_before_restore_'+str(time.time_ns()))
+            try:
+                for suffix in ('-wal','-shm'):(self.dir/('movievault.sqlite'+suffix)).unlink(missing_ok=True)
+                os.replace(candidate,self.db)
+                if (staged/'posters').exists():
+                    if self.posters.exists():os.replace(self.posters,old_posters)
+                    os.replace(staged/'posters',self.posters)
+            except Exception:
+                for suffix in ('-wal','-shm'):(self.dir/('movievault.sqlite'+suffix)).unlink(missing_ok=True)
+                # The rollback snapshot is a complete SQLite backup of the live
+                # catalog taken immediately before activation.
+                os.replace(rollback,self.db)
+                if old_posters.exists():
+                    if self.posters.exists():shutil.rmtree(self.posters,ignore_errors=True)
+                    os.replace(old_posters,self.posters)
+                raise
+            finally:
+                if old_posters.exists():shutil.rmtree(old_posters,ignore_errors=True)
+    def _quarantine_failed_restore(self,pending:Path,failure:Exception) -> bool:
+        quarantined=False
+        try:
+            folder=self.dir/'restore_quarantine';folder.mkdir(exist_ok=True)
+            target=folder/('restore_failed_'+time.strftime('%Y%m%d_%H%M%S')+'_'+str(time.time_ns())+'.zip')
+            os.replace(pending,target);quarantined=True
+        except OSError:
+            # Even if quarantine is unavailable, never let the pending restore
+            # prevent normal startup. It will be retried safely on a later launch.
+            quarantined=False
+        try:self.diagnostics.event('restore_activation_recovered',failure_type=type(failure).__name__,quarantined=quarantined)
+        except OSError:pass
+        return quarantined
     def process_pending_restore(self):
         pending=self.dir/'restore_pending.zip'
         if not pending.exists():return
-        self.validate_backup(pending)
-        safety=self.backups/('Before_Restore_'+time.strftime('%Y%m%d_%H%M%S')+'.zip')
-        self.backup(safety)
-        with tempfile.TemporaryDirectory(dir=self.dir) as td:
-            d=Path(td)
-            with zipfile.ZipFile(pending) as z:
-                z.extract('movievault.sqlite',d)
-                for info in z.infolist():
-                    if re.fullmatch(r'posters/\d+\.jpg',info.filename):z.extract(info,d)
-            candidate=d/'movievault.sqlite'
-            check=sqlite3.connect(str(candidate))
-            try:
-                if check.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValidationError('Backup database failed integrity check')
-                sv=check.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-                if not sv or int(sv[0])>SCHEMA_VERSION:raise ValidationError('Incompatible database schema')
-            finally:check.close()
-            # sqlite WAL removal only before opening Catalog to avoid stale pages.
-            for suffix in ('-wal','-shm'):(self.dir/('movievault.sqlite'+suffix)).unlink(missing_ok=True)
-            os.replace(candidate,self.db)
-            if (d/'posters').exists():
-                old=self.dir/'posters_before_restore';shutil.rmtree(old,ignore_errors=True)
-                if self.posters.exists():os.replace(self.posters,old)
-                os.replace(d/'posters',self.posters)
-                shutil.rmtree(old,ignore_errors=True)
+        try:
+            info=self.validate_backup(pending)
+            safety=self.backups/('Before_Restore_'+time.strftime('%Y%m%d_%H%M%S')+'.zip')
+            if safety.exists():safety=safety.with_name(safety.stem+'_'+str(time.time_ns())+'.zip')
+            self.backup(safety)
+            self._activate_restore_archive(pending,info['manifest'])
+        except Exception as failure:
+            self._quarantine_failed_restore(pending,failure)
+            return False
         pending.unlink(missing_ok=True)
+        try:self.diagnostics.event('restore_activated')
+        except OSError:pass
+        return True

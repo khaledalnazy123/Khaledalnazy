@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.0-rc.2 — P0 release-blocker remediation
+- Migration now copies only an explicit allowlist of non-secret preferences, sanitizes older pending imports, and safely removes legacy credential rows from already migrated v2 catalogs before they can be backed up.
+- Restore archives now receive bounded CRC, manifest, schema, table, and SQLite integrity validation before staging; failed activation rolls back the live catalog, quarantines the pending archive, records a privacy-safe recovery event, and permits normal startup.
+
 ## 2.0.0-rc.1 — source release candidate
 - Separate v2 profile and opt-in import from v1 app/data folder, SQLite or backup ZIP; preview counts, snapshot and no credential carry-over.
 - Fixed staging checkpoint issue uncovered in regression QA: the migrated SQLite file must not depend on WAL sidecars after activation.
