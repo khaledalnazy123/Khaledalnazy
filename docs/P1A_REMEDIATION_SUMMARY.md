@@ -20,16 +20,17 @@ This batch addresses only MV-AUD-003, MV-AUD-004, and MV-AUD-007 from `CODEX_INI
 
 - The sampled fingerprint remains only a candidate shortlist key.
 - A new additive `content_sha256` movie column stores a full-file SHA-256 digest. Existing catalogs gain it through the normal additive initialization path, and unchanged legacy rows are backfilled when next scanned.
+- Restore validates the archived core schema first, then applies the same non-destructive additive schema helper to the private candidate before activation. Older valid v2 backups without `content_sha256` therefore remain usable by the already-running `Catalog` and can backfill the digest during their next scan.
 - Relinking to a different path requires exactly one absent candidate with the same nonempty full digest. Missing legacy digests, digest mismatches, and multiple full-digest matches do not auto-relink.
 - Identity verification reads media only; it does not rename, delete, or rewrite movie files.
 
 ## Verification
 
-- Dedicated P1A regression tests: **5/5 passed** with `ResourceWarning` promoted to an error.
-- Full unit/integration suite: **64/64 passed in 6.436 seconds**.
-- Strict full suite: **64/64 passed in 6.606 seconds** with `ResourceWarning` promoted to an error.
+- Dedicated P1A regression tests: **6/6 passed in 0.143 seconds** with `ResourceWarning` promoted to an error.
+- Full unit/integration suite: **65/65 passed in 6.492 seconds**.
+- Strict full suite: **65/65 passed in 6.370 seconds** with `ResourceWarning` promoted to an error.
 - Python compilation: **PASSED**.
-- Automated QA runner: **PASS** for 64 unit/integration tests, Python compilation, and Playwright visual smoke. See `qa_reports/QA_20261005_140703.txt` and `.json`.
+- Automated QA runner: **PASS** for 65 unit/integration tests, Python compilation, and Playwright visual smoke. See `qa_reports/QA_20261005_142708.txt` and `.json`.
 - A separate Playwright visual smoke run passed with three movie cards, settings panels, two subtitle rows, modal navigation, and no page errors.
 
 No Windows, WebView2, DPAPI, packaged executable, installer, VLC/mpv, or live provider verification was performed in this batch.

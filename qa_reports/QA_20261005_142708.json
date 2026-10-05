@@ -1,0 +1,35 @@
+{
+  "product": "MovieVault",
+  "suite": "Automated QA",
+  "created": "2026-10-05T14:27:19+0000",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "python": "3.12.14",
+  "passed": true,
+  "results": [
+    {
+      "name": "Unit + integration regression tests",
+      "command": "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python -m unittest discover -s tests -q",
+      "returncode": 0,
+      "seconds": 6.508,
+      "stdout": "",
+      "stderr": "----------------------------------------------------------------------\nRan 65 tests in 6.362s\n\nOK\n"
+    },
+    {
+      "name": "Python syntax compile",
+      "command": "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python -m compileall -q mv_core.py mv_diagnostics.py mv_gemini.py mv_migration.py mv_playback.py mv_server.py mv_tmdb.py MovieVault.pyw dev.py tests",
+      "returncode": 0,
+      "seconds": 0.028,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "Visual browser smoke test",
+      "command": "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python tests/visual_smoke.py",
+      "returncode": 0,
+      "seconds": 4.37,
+      "stdout": "Home: cards= 3 errors= []\nSettings: migration= True gemini= True errors= []\nDetails:  Dont Look Up (2021) subtitle rows= 2 errors= []\nClosing edit returns movie: 1\nVISUAL SMOKE PASSED\n",
+      "stderr": ""
+    }
+  ],
+  "note": "This automated suite does not replace real Windows acceptance testing for WebView2, DPAPI, external API credentials, VLC/mpv and Setup.exe."
+}

@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import zipfile
@@ -85,6 +86,44 @@ class P1ALibraryIntegrityTests(unittest.TestCase):
         self.assertTrue(live.process_pending_restore())
         self.assertEqual(live.poster_bytes(source_id),source_poster)
         self.assertEqual([path.name for path in live.posters.iterdir()],[f'{source_id}.jpg'])
+
+    def test_restore_upgrades_older_v2_additive_schema_before_same_instance_scan(self):
+        media_root=self.base/'older_v2_media';media_root.mkdir()
+        media=media_root/'Older Backup Movie (2024).mkv';media.write_bytes(b'older-v2-media'*30000)
+        source=self.catalog('source-older-v2')
+        root_id=source.add_root(media_root)['id'];self.scan(source,root_id)
+        current_backup=Path(source.backup(self.base/'current-schema.zip'))
+
+        older_db=self.base/'older-v2.sqlite'
+        with zipfile.ZipFile(current_backup) as archive:
+            older_db.write_bytes(archive.read('movievault.sqlite'))
+        with sqlite3.connect(older_db) as db:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute('ALTER TABLE movies DROP COLUMN content_sha256')
+        with sqlite3.connect(older_db) as db:
+            columns={row[1] for row in db.execute('PRAGMA table_info(movies)')}
+        self.assertNotIn('content_sha256',columns)
+
+        older_backup=self.base/'older-v2-backup.zip'
+        with zipfile.ZipFile(current_backup) as source_archive,zipfile.ZipFile(older_backup,'w',zipfile.ZIP_DEFLATED) as output:
+            for info in source_archive.infolist():
+                data=older_db.read_bytes() if info.filename=='movievault.sqlite' else source_archive.read(info)
+                output.writestr(info,data)
+
+        live=self.catalog('live-older-v2')
+        live.stage_restore(older_backup)
+        self.assertTrue(live.process_pending_restore())
+        with live.connect() as db:
+            restored_columns={row['name'] for row in db.execute('PRAGMA table_info(movies)')}
+            before=db.execute('SELECT content_sha256 FROM movies').fetchone()['content_sha256']
+        self.assertIn('content_sha256',restored_columns)
+        self.assertEqual(before,'')
+
+        result=self.scan(live,root_id)
+        self.assertEqual(result['failed_files'],0)
+        with live.connect() as db:
+            digest=db.execute('SELECT content_sha256 FROM movies').fetchone()['content_sha256']
+        self.assertEqual(digest,file_content_sha256(media))
 
     def test_scan_continues_when_discovered_file_disappears_before_stat(self):
         catalog=self.catalog('scan-disappears');root=self.base/'scan_disappears_movies';root.mkdir()

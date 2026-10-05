@@ -38,6 +38,24 @@ BACKUP_REQUIRED_COLUMNS = {
     'settings': frozenset({'key','value'}),
     'imdb_titles': frozenset({'tconst','title_norm','primary_title','year','genres','runtime'}),
 }
+MOVIE_ADDITIVE_COLUMNS = {
+    'poster_attempted_at': "TEXT DEFAULT ''",
+    'resolution_verified': 'INTEGER DEFAULT 0',
+    'content_sha256': "TEXT DEFAULT ''",
+    'tmdb_id': 'INTEGER',
+    'cast_names': "TEXT DEFAULT ''",
+    'overview': "TEXT DEFAULT ''",
+    'tmdb_rating': 'REAL',
+    'tmdb_metadata_at': "TEXT DEFAULT ''",
+    'personal_rating': 'REAL',
+    'favorite': 'INTEGER DEFAULT 0',
+    'preferred_subtitle_id': 'INTEGER',
+    'playback_preference': "TEXT DEFAULT 'auto'",
+}
+SUBTITLE_ADDITIVE_COLUMNS = {
+    'language_manual': 'INTEGER DEFAULT 0',
+    'translator': "TEXT DEFAULT ''",
+}
 
 def normalize(v: str) -> str:
     v = unicodedata.normalize('NFKD', v or '').casefold()
@@ -204,6 +222,30 @@ def _validate_restore_database(path:Path,manifest_schema:int) -> None:
     except (sqlite3.DatabaseError,ValueError,OSError) as exc:
         raise ValidationError('Backup database is corrupt or unreadable') from exc
 
+def _ensure_additive_schema(db:sqlite3.Connection) -> None:
+    """Apply current non-destructive schema additions to an open catalog."""
+    existing={row[1] for row in db.execute('PRAGMA table_info(movies)')}
+    for name,definition in MOVIE_ADDITIVE_COLUMNS.items():
+        if name not in existing:db.execute(f'ALTER TABLE movies ADD COLUMN {name} {definition}')
+    subtitle_columns={row[1] for row in db.execute('PRAGMA table_info(subtitles)')}
+    for name,definition in SUBTITLE_ADDITIVE_COLUMNS.items():
+        if name not in subtitle_columns:db.execute(f'ALTER TABLE subtitles ADD COLUMN {name} {definition}')
+    db.execute('CREATE TABLE IF NOT EXISTS subtitle_sources(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
+    db.execute("CREATE TABLE IF NOT EXISTS ai_suggestions(movie_id INTEGER PRIMARY KEY,suggested_title TEXT,suggested_year INTEGER,suggested_imdb_id TEXT,reason TEXT,status TEXT,created_at TEXT)")
+
+def _upgrade_restore_candidate_schema(path:Path) -> None:
+    """Normalize a validated private restore candidate before activation."""
+    db=sqlite3.connect(str(path),timeout=15)
+    try:
+        db.execute('PRAGMA trusted_schema=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
+        db.execute('PRAGMA journal_mode=DELETE')
+        _ensure_additive_schema(db)
+        db.commit()
+    except Exception:
+        db.rollback();raise
+    finally:db.close()
+
 class Catalog:
     def __init__(self,data_dir:Path|str|None=None):
         self.dir=Path(data_dir or default_data_dir());self.dir.mkdir(parents=True,exist_ok=True)
@@ -266,21 +308,7 @@ class Catalog:
             row=c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
             if row and int(row['value'])>SCHEMA_VERSION:raise RuntimeError('This library belongs to a newer MovieVault version. Refusing to modify it.')
             # Safe additive migrations for earlier preview databases (never drop old data).
-            existing={r['name'] for r in c.execute('PRAGMA table_info(movies)')}
-            for name,definition in {
-                'poster_attempted_at':"TEXT DEFAULT ''",
-                'resolution_verified':'INTEGER DEFAULT 0',
-                'content_sha256':"TEXT DEFAULT ''",
-                'tmdb_id':'INTEGER', 'cast_names':"TEXT DEFAULT ''", 'overview':"TEXT DEFAULT ''", 'tmdb_rating':'REAL', 'tmdb_metadata_at':"TEXT DEFAULT ''",
-                'personal_rating':'REAL', 'favorite':'INTEGER DEFAULT 0',
-                'preferred_subtitle_id':'INTEGER', 'playback_preference':"TEXT DEFAULT 'auto'"
-            }.items():
-                if name not in existing:c.execute(f'ALTER TABLE movies ADD COLUMN {name} {definition}')
-            subtitlecols={r['name'] for r in c.execute('PRAGMA table_info(subtitles)')}
-            for name,definition in {'language_manual':'INTEGER DEFAULT 0','translator':"TEXT DEFAULT ''"}.items():
-                if name not in subtitlecols:c.execute(f'ALTER TABLE subtitles ADD COLUMN {name} {definition}')
-            c.execute('CREATE TABLE IF NOT EXISTS subtitle_sources(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
-            c.execute("CREATE TABLE IF NOT EXISTS ai_suggestions(movie_id INTEGER PRIMARY KEY,suggested_title TEXT,suggested_year INTEGER,suggested_imdb_id TEXT,reason TEXT,status TEXT,created_at TEXT)")
+            _ensure_additive_schema(c)
             if row and int(row['value'])<2:
                 c.execute("UPDATE movies SET resolution_tag=CASE WHEN width>=3400 OR height>=2000 THEN '4K' WHEN width>=1700 OR height>=1000 THEN '1080p' WHEN width>=1200 OR height>=700 THEN '720p' WHEN width>=700 OR height>=470 THEN '480p' ELSE 'SD' END,resolution_verified=1 WHERE width IS NOT NULL AND height IS NOT NULL")
             c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
@@ -1229,6 +1257,11 @@ class Catalog:
                 with z.open(info) as source,target.open('wb') as output:
                     copied=_copy_limited(source,output,BACKUP_MAX_POSTER_BYTES)
                 if copied!=info.file_size:raise ValidationError('Backup poster size is inconsistent')
+        # Validate the archive's original core structure before adding current
+        # runtime columns. This keeps older valid backups compatible without
+        # allowing normalization to conceal a malformed core schema.
+        _validate_restore_database(database,int(manifest['schema']))
+        _upgrade_restore_candidate_schema(database)
         # The staged database and poster directory are one catalog generation.
         # Keep only members referenced by that database and clear every reference
         # whose poster was intentionally omitted (including TMDb cache artwork).
