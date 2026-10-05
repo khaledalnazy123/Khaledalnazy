@@ -21,8 +21,102 @@ REQUIRED_TABLES = {'meta', 'roots', 'movies', 'subtitles', 'settings', 'imdb_tit
 MAX_DATABASE_BYTES = 3_000_000_000
 MAX_ARCHIVE_BYTES = 4_000_000_000
 
+# Only these user preferences may cross the v1 -> v2 trust boundary. Provider
+# selections and AI state are reset because their credentials deliberately do not
+# migrate. Unknown rows are not carried forward: old releases and local forks may
+# have stored credentials in the settings table under arbitrary names.
+MIGRATABLE_SETTING_KEYS = frozenset({
+    'auto_posters',
+    'poster_in_folder',
+    'archive_missing',
+    'auto_imdb',
+    'default_external_subtitle_lang',
+    'theme',
+    'auto_frame_fallback',
+})
+
+# Current v2 settings are safe preferences, not credentials. This wider allowlist
+# is used once when cleaning catalogs that were already migrated and may since
+# have acquired legitimate v2 provider/model preferences.
+CURRENT_V2_SETTING_KEYS = MIGRATABLE_SETTING_KEYS | frozenset({
+    'poster_provider',
+    'auto_gemini_fallback',
+    'gemini_model',
+})
+SETTINGS_SANITIZED_META_KEY = 'legacy_settings_sanitized'
+
 class MigrationError(Exception):
     pass
+
+
+def _retain_setting_allowlist(conn: sqlite3.Connection, allowed: frozenset[str]) -> int:
+    placeholders=','.join('?' for _ in allowed)
+    cursor=conn.execute(f'DELETE FROM settings WHERE key NOT IN ({placeholders})',tuple(sorted(allowed)))
+    return max(0,int(cursor.rowcount))
+
+
+def _sanitize_staged_legacy_database(db_path: Path) -> int:
+    """Remove every non-allowlisted v1 setting from a private staged copy."""
+    conn=sqlite3.connect(str(db_path))
+    try:
+        removed=_retain_setting_allowlist(conn,MIGRATABLE_SETTING_KEYS)
+        for key,value in {
+            'poster_provider':'commons',
+            'auto_gemini_fallback':'0',
+            'gemini_model':'',
+        }.items():
+            conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(key,value))
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(SETTINGS_SANITIZED_META_KEY,'1'))
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def cleanup_migrated_v2_database(db_path: str|Path) -> int:
+    """One-time cleanup for v2 catalogs activated by older migration code.
+
+    The cleanup is deliberately limited to databases carrying v1_imported_at and
+    lacking our completion marker. It never opens or modifies the original v1
+    source database.
+    """
+    path=Path(db_path)
+    if not path.is_file() or path.is_symlink():return 0
+    conn=sqlite3.connect(str(path),timeout=30)
+    try:
+        tables={r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {'meta','settings'} <= tables:return 0
+        imported=conn.execute("SELECT 1 FROM meta WHERE key='v1_imported_at'").fetchone()
+        completed=conn.execute('SELECT 1 FROM meta WHERE key=?',(SETTINGS_SANITIZED_META_KEY,)).fetchone()
+        if not imported or completed:return 0
+        removed=_retain_setting_allowlist(conn,CURRENT_V2_SETTING_KEYS)
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(SETTINGS_SANITIZED_META_KEY,'1'))
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def sanitize_restored_migrated_v2_database(db_path: str|Path) -> int:
+    """Sanitize a private restore candidate originating from a v1 import.
+
+    Restore archives may predate the one-time completion marker or may contain a
+    marker written before unsafe rows were introduced. Enforce the current safe
+    preference allowlist every time a v1-derived catalog is restored, while it is
+    still private and before it can replace the live database.
+    """
+    path=Path(db_path)
+    if not path.is_file() or path.is_symlink():return 0
+    conn=sqlite3.connect(str(path),timeout=30)
+    try:
+        imported=conn.execute("SELECT 1 FROM meta WHERE key='v1_imported_at'").fetchone()
+        if not imported:return 0
+        removed=_retain_setting_allowlist(conn,CURRENT_V2_SETTING_KEYS)
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(SETTINGS_SANITIZED_META_KEY,'1'))
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
 
 
 def legacy_data_dir() -> Path:
@@ -153,10 +247,17 @@ def _snapshot_source(info:dict, dest:Path) -> None:
         for (movie_id,) in old_tmdb:
             (dest/'posters'/f'{movie_id}.jpg').unlink(missing_ok=True)
             db.execute("UPDATE movies SET poster_path='',poster_source='',poster_credit='',poster_attempted_at='' WHERE id=?",(movie_id,))
-        # Provider credentials deliberately stay on the old account/profile.
-        # A migrated provider selection must not claim a connected account.
-        db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('poster_provider','commons')")
-        db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('gemini_model','')")
+        # Provider credentials deliberately stay on the old account/profile. An
+        # explicit allowlist prevents any legacy/extension credential row from
+        # crossing into the staged v2 database or its future backups.
+        _retain_setting_allowlist(db,MIGRATABLE_SETTING_KEYS)
+        for key,value in {
+            'poster_provider':'commons',
+            'auto_gemini_fallback':'0',
+            'gemini_model':'',
+        }.items():
+            db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(key,value))
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(SETTINGS_SANITIZED_META_KEY,'1'))
         db.commit()
     finally:
         db.close()
@@ -203,6 +304,9 @@ def apply_pending_migration(target_dir:str|Path) ->bool:
     target=Path(target_dir).expanduser().resolve();pending=target/STAGE_NAME
     if not pending.is_dir():return False
     manifest=json.loads((pending/'migration.json').read_text(encoding='utf8'))
+    # A pending directory may have been produced by a vulnerable earlier build.
+    # Sanitize the private staged copy before it can replace the live v2 catalog.
+    _sanitize_staged_legacy_database(pending/'movievault.sqlite')
     info=_inspect_db(pending/'movievault.sqlite')
     if any(info[k]!=manifest['counts'][k] for k in ('movies','imdb_titles','roots','subtitles')):
         raise MigrationError('Pending import did not pass final integrity checks.')
