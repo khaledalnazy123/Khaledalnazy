@@ -22,6 +22,22 @@ BACKUP_MAX_UNCOMPRESSED_BYTES = 1_200_000_000
 BACKUP_MAX_DATABASE_BYTES = 1_000_000_000
 BACKUP_MAX_POSTER_BYTES = 12_000_000
 BACKUP_REQUIRED_TABLES = frozenset({'meta','roots','movies','subtitles','settings','imdb_titles'})
+BACKUP_REQUIRED_COLUMNS = {
+    'meta': frozenset({'key','value'}),
+    'roots': frozenset({'id','path','enabled','last_scan','last_status'}),
+    'movies': frozenset({
+        'id','root_id','relative_path','original_filename','current_filename','display_title','year','genres',
+        'imdb_id','imdb_rating','source','release_group','resolution_tag','size_bytes','duration','resolution',
+        'width','height','video_codec','video_bitrate','video_bitrate_estimated','audio_codec','audio_bitrate',
+        'overall_bitrate','overall_bitrate_estimated','channels','audio_layout','fps','hdr','audio_streams',
+        'video_streams','subtitle_streams','container','probe_error','raw_probe','fingerprint','status','added_at',
+        'last_seen','modified_ns','poster_path','poster_source','poster_credit','poster_locked','subtitle_source',
+        'translation_quality','notes','watched','manual_fields',
+    }),
+    'subtitles': frozenset({'id','movie_id','kind','filename','format','language','stream_index','source','quality'}),
+    'settings': frozenset({'key','value'}),
+    'imdb_titles': frozenset({'tconst','title_norm','primary_title','year','genres','runtime'}),
+}
 
 def normalize(v: str) -> str:
     v = unicodedata.normalize('NFKD', v or '').casefold()
@@ -155,6 +171,11 @@ def _validate_restore_database(path:Path,manifest_schema:int) -> None:
             if integrity!=['ok']:raise ValidationError('Backup database failed integrity check')
             tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not BACKUP_REQUIRED_TABLES <= tables:raise ValidationError('Backup database is missing required tables')
+            for table,required in BACKUP_REQUIRED_COLUMNS.items():
+                columns={r[1] for r in db.execute(f'PRAGMA table_info({table})')}
+                missing=sorted(required-columns)
+                if missing:
+                    raise ValidationError(f'Backup database table {table} is missing required columns: {", ".join(missing)}')
             row=db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
             if not row:raise ValidationError('Backup database has no schema version')
             db_schema=int(row[0])
@@ -1174,6 +1195,12 @@ class Catalog:
         with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
             staged=Path(td)/'staged';staged.mkdir()
             candidate=self._extract_restore_archive(pending,staged,manifest)
+            # Older vulnerable v2 backups can contain arbitrary legacy settings
+            # copied from v1. Sanitize the private extracted candidate before it
+            # can replace the live database or become visible to any API/provider.
+            from mv_migration import sanitize_restored_migrated_v2_database
+            sanitize_restored_migrated_v2_database(candidate)
+            _validate_restore_database(candidate,int(manifest['schema']))
             rollback=Path(td)/'live_before_restore.sqlite'
             with self.connect() as current:
                 snapshot=sqlite3.connect(str(rollback))

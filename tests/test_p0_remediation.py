@@ -13,7 +13,7 @@ from PIL import Image
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
-from mv_core import Catalog,ValidationError
+from mv_core import BACKUP_REQUIRED_TABLES,Catalog,ValidationError
 from mv_migration import (
     CURRENT_V2_SETTING_KEYS,
     MIGRATABLE_SETTING_KEYS,
@@ -140,6 +140,56 @@ class P0RemediationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError,'missing required tables'):
             catalog.stage_restore(incomplete)
         self.assertFalse((catalog.dir/'restore_pending.zip').exists())
+
+    def test_integrity_valid_database_with_missing_core_columns_never_reaches_pending(self):
+        source=Catalog(self.base/'structural-source')
+        malformed_db=self.base/'missing-columns.sqlite'
+        with source.connect() as live,sqlite3.connect(str(malformed_db)) as output:
+            live.backup(output)
+        with sqlite3.connect(str(malformed_db)) as db:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute('PRAGMA foreign_keys=OFF')
+            db.execute('ALTER TABLE movies RENAME TO movies_complete')
+            db.execute('CREATE TABLE movies(id INTEGER PRIMARY KEY)')
+            db.execute('DROP TABLE movies_complete')
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+            tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertTrue(BACKUP_REQUIRED_TABLES <= tables)
+        malformed=self.base/'missing-columns.zip'
+        with zipfile.ZipFile(malformed,'w') as archive:
+            archive.writestr('manifest.json',json.dumps({'product':'MovieVault','schema':3}))
+            archive.write(malformed_db,'movievault.sqlite')
+
+        live=Catalog(self.base/'structural-live')
+        with self.assertRaisesRegex(ValidationError,'movies is missing required columns'):
+            live.stage_restore(malformed)
+        self.assertFalse((live.dir/'restore_pending.zip').exists())
+
+    def test_restored_v1_derived_catalog_is_sanitized_before_becoming_active(self):
+        vulnerable=Catalog(self.base/'vulnerable-backup');self.movie(vulnerable,'Restored Movie')
+        with vulnerable.connect() as db:
+            db.execute("INSERT INTO meta(key,value) VALUES('v1_imported_at','2026-09-01')")
+            db.execute('DELETE FROM meta WHERE key=?',(SETTINGS_SANITIZED_META_KEY,))
+            db.executemany('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',[
+                ('theme','light'),
+                ('tmdb_token','SYNTHETIC_RESTORED_TOKEN'),
+                ('legacy_api_key','SYNTHETIC_RESTORED_KEY'),
+                ('client_secret','SYNTHETIC_RESTORED_SECRET'),
+            ])
+        restore=Path(vulnerable.backup(self.base/'vulnerable.zip'))
+
+        live=Catalog(self.base/'restore-target');self.movie(live,'Live Movie')
+        live.stage_restore(restore)
+        self.assertTrue(live.process_pending_restore())
+
+        active=live.settings()
+        self.assertEqual(active['theme'],'light')
+        self.assertNotIn('tmdb_token',active)
+        self.assertNotIn('legacy_api_key',active)
+        self.assertNotIn('client_secret',active)
+        with live.connect() as db:
+            marker=db.execute('SELECT value FROM meta WHERE key=?',(SETTINGS_SANITIZED_META_KEY,)).fetchone()
+        self.assertEqual(marker['value'],'1')
 
     def test_crc_failure_never_reaches_pending(self):
         source=Catalog(self.base/'source');original=Path(source.backup(self.base/'original.zip'))

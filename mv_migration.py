@@ -97,6 +97,28 @@ def cleanup_migrated_v2_database(db_path: str|Path) -> int:
         conn.close()
 
 
+def sanitize_restored_migrated_v2_database(db_path: str|Path) -> int:
+    """Sanitize a private restore candidate originating from a v1 import.
+
+    Restore archives may predate the one-time completion marker or may contain a
+    marker written before unsafe rows were introduced. Enforce the current safe
+    preference allowlist every time a v1-derived catalog is restored, while it is
+    still private and before it can replace the live database.
+    """
+    path=Path(db_path)
+    if not path.is_file() or path.is_symlink():return 0
+    conn=sqlite3.connect(str(path),timeout=30)
+    try:
+        imported=conn.execute("SELECT 1 FROM meta WHERE key='v1_imported_at'").fetchone()
+        if not imported:return 0
+        removed=_retain_setting_allowlist(conn,CURRENT_V2_SETTING_KEYS)
+        conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',(SETTINGS_SANITIZED_META_KEY,'1'))
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
 def legacy_data_dir() -> Path:
     # v1.0 stored data outside the source-code folder.
     if os.name == 'nt':
