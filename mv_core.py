@@ -233,6 +233,16 @@ def _ensure_additive_schema(db:sqlite3.Connection) -> None:
     db.execute('CREATE TABLE IF NOT EXISTS subtitle_sources(name TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
     db.execute("CREATE TABLE IF NOT EXISTS ai_suggestions(movie_id INTEGER PRIMARY KEY,suggested_title TEXT,suggested_year INTEGER,suggested_imdb_id TEXT,reason TEXT,status TEXT,created_at TEXT)")
 
+def _upgrade_catalog_schema(db:sqlite3.Connection) -> None:
+    """Apply safe migrations and record the resulting current schema version."""
+    row=db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    previous_schema=int(row[0]) if row else 0
+    if previous_schema>SCHEMA_VERSION:raise RuntimeError('This library belongs to a newer MovieVault version. Refusing to modify it.')
+    _ensure_additive_schema(db)
+    if previous_schema<2:
+        db.execute("UPDATE movies SET resolution_tag=CASE WHEN width>=3400 OR height>=2000 THEN '4K' WHEN width>=1700 OR height>=1000 THEN '1080p' WHEN width>=1200 OR height>=700 THEN '720p' WHEN width>=700 OR height>=470 THEN '480p' ELSE 'SD' END,resolution_verified=1 WHERE width IS NOT NULL AND height IS NOT NULL")
+    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
+
 def _upgrade_restore_candidate_schema(path:Path) -> None:
     """Normalize a validated private restore candidate before activation."""
     db=sqlite3.connect(str(path),timeout=15)
@@ -240,7 +250,7 @@ def _upgrade_restore_candidate_schema(path:Path) -> None:
         db.execute('PRAGMA trusted_schema=OFF')
         db.execute('PRAGMA foreign_keys=ON')
         db.execute('PRAGMA journal_mode=DELETE')
-        _ensure_additive_schema(db)
+        _upgrade_catalog_schema(db)
         db.commit()
     except Exception:
         db.rollback();raise
@@ -305,13 +315,8 @@ class Catalog:
             CREATE INDEX IF NOT EXISTS imdb_title_norm_idx ON imdb_titles(title_norm,year);
             CREATE TABLE IF NOT EXISTS imdb_ratings(tconst TEXT PRIMARY KEY,rating REAL,votes INTEGER);
             ''')
-            row=c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row and int(row['value'])>SCHEMA_VERSION:raise RuntimeError('This library belongs to a newer MovieVault version. Refusing to modify it.')
-            # Safe additive migrations for earlier preview databases (never drop old data).
-            _ensure_additive_schema(c)
-            if row and int(row['value'])<2:
-                c.execute("UPDATE movies SET resolution_tag=CASE WHEN width>=3400 OR height>=2000 THEN '4K' WHEN width>=1700 OR height>=1000 THEN '1080p' WHEN width>=1200 OR height>=700 THEN '720p' WHEN width>=700 OR height>=470 THEN '480p' ELSE 'SD' END,resolution_verified=1 WHERE width IS NOT NULL AND height IS NOT NULL")
-            c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
+            # Safe migrations for earlier preview databases (never drop old data).
+            _upgrade_catalog_schema(c)
             for k,v in {'auto_posters':'1','poster_in_folder':'1','archive_missing':'1','auto_imdb':'1','poster_provider':'commons','default_external_subtitle_lang':'Arabic','theme':'dark','auto_frame_fallback':'0','auto_gemini_fallback':'0','gemini_model':''}.items():
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',(k,v))
             for r in c.execute("SELECT id,poster_path FROM movies WHERE poster_path<>''").fetchall():
@@ -1278,7 +1283,7 @@ class Catalog:
                 stored=(poster_path or '').replace('\\','/')
                 if stored!=expected or not (poster_generation/f'{movie_id}.jpg').is_file():
                     db.execute("UPDATE movies SET poster_path='',poster_source='',poster_credit='',poster_locked=0,poster_attempted_at='' WHERE id=?",(movie_id,))
-        _validate_restore_database(database,int(manifest['schema']))
+        _validate_restore_database(database,SCHEMA_VERSION)
         return database
     def _activate_restore_archive(self,pending:Path,manifest:dict):
         with tempfile.TemporaryDirectory(prefix='mv-restore-',dir=self.dir) as td:
@@ -1289,7 +1294,7 @@ class Catalog:
             # can replace the live database or become visible to any API/provider.
             from mv_migration import sanitize_restored_migrated_v2_database
             sanitize_restored_migrated_v2_database(candidate)
-            _validate_restore_database(candidate,int(manifest['schema']))
+            _validate_restore_database(candidate,SCHEMA_VERSION)
             rollback=Path(td)/'live_before_restore.sqlite'
             with self.connect() as current:
                 snapshot=sqlite3.connect(str(rollback))

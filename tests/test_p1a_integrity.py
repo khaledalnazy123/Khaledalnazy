@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from mv_core import Catalog,file_content_sha256,file_fingerprint
+from mv_core import Catalog,SCHEMA_VERSION,file_content_sha256,file_fingerprint
 
 
 class P1ALibraryIntegrityTests(unittest.TestCase):
@@ -124,6 +124,41 @@ class P1ALibraryIntegrityTests(unittest.TestCase):
         with live.connect() as db:
             digest=db.execute('SELECT content_sha256 FROM movies').fetchone()['content_sha256']
         self.assertEqual(digest,file_content_sha256(media))
+
+    def test_restored_older_schema_is_normalized_before_same_instance_rebackup(self):
+        source=self.catalog('source-older-schema');movie_id=self.movie(source,'Older Schema Movie')
+        current_backup=Path(source.backup(self.base/'current-version.zip'))
+        older_db=self.base/'schema-2.sqlite'
+        with zipfile.ZipFile(current_backup) as archive:
+            older_db.write_bytes(archive.read('movievault.sqlite'))
+        with sqlite3.connect(older_db) as db:
+            db.execute('PRAGMA journal_mode=DELETE')
+            db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+
+        older_backup=self.base/'schema-2-backup.zip'
+        with zipfile.ZipFile(current_backup) as source_archive,zipfile.ZipFile(older_backup,'w',zipfile.ZIP_DEFLATED) as output:
+            for info in source_archive.infolist():
+                if info.filename=='movievault.sqlite':data=older_db.read_bytes()
+                elif info.filename=='manifest.json':
+                    manifest=json.loads(source_archive.read(info));manifest['schema']=2
+                    data=json.dumps(manifest,separators=(',',':')).encode('utf8')
+                else:data=source_archive.read(info)
+                output.writestr(info,data)
+
+        live=self.catalog('live-older-schema')
+        self.assertEqual(live.validate_backup(older_backup)['manifest']['schema'],2)
+        live.stage_restore(older_backup)
+        self.assertTrue(live.process_pending_restore())
+        self.assertEqual(live.movie(movie_id)['display_title'],'Older Schema Movie')
+        with live.connect() as db:
+            schema=db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()['value']
+        self.assertEqual(schema,str(SCHEMA_VERSION))
+
+        same_instance_backup=Path(live.backup(self.base/'same-instance-current.zip'))
+        self.assertEqual(live.validate_backup(same_instance_backup)['manifest']['schema'],SCHEMA_VERSION)
+        live.stage_restore(same_instance_backup)
+        self.assertTrue(live.process_pending_restore())
+        self.assertEqual(live.movie(movie_id)['display_title'],'Older Schema Movie')
 
     def test_scan_continues_when_discovered_file_disappears_before_stat(self):
         catalog=self.catalog('scan-disappears');root=self.base/'scan_disappears_movies';root.mkdir()
