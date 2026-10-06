@@ -41,7 +41,7 @@ S21-01 through S21-05 remain explicitly outside the v2.0 Stable source gate: gro
 
 **SOURCE SCOPE NOT COMPLETE — TARGETED FIXES REQUIRED BEFORE WINDOWS ACCEPTANCE**
 
-The seven source blockers above must be remediated and tested before the native-Windows acceptance gate. S06-10 also needs a product decision about whether player-native embedded-track selection satisfies the literal “Selected where applicable” requirement.
+The seven source blockers above must be remediated and tested before the native-Windows acceptance gate. S06-10 is resolved as **NOT APPLICABLE** to an app-level embedded-track selector in v2.0: the locked scope requires embedded subtitle cataloging plus preferred playback behavior and explicit external-subtitle selection, while embedded stream choice may remain player-native. Real player behavior remains covered by the VLC/mpv Windows acceptance gate.
 
 ## Detailed requirement matrix
 
@@ -156,7 +156,7 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 | S06-07 | mpv support | PASS — IMPLEMENTED, WINDOWS ACCEPTANCE REQUIRED | `find_player`; mpv argument-list launch | `test_mpv_command_is_argument_list_and_original_unmodified` | Yes | No | Needs real installed mpv verification. |
 | S06-08 | Launch external subtitle without permanent renaming | PASS — IMPLEMENTED & AUTOMATED | `--sub-file` argument; no rename/copy | all playback tests | No | No | Original subtitle path is passed directly. |
 | S06-09 | Preserve movie/subtitle originals during playback | PASS — IMPLEMENTED & AUTOMATED | read-only plan and subprocess arguments | original-unmodified playback test | No | No | — |
-| S06-10 | Literal selected embedded-stream behavior | REVIEW DECISION NEEDED | Embedded rows are cataloged, but `_verified_external` rejects them and delegates selection to the player's own UI | embedded catalog coverage; no app-selected embedded stream test | Yes | Decision required | Decide whether player-native selection satisfies “Selected where applicable”; do not invent an app-level track-ID requirement silently. |
+| S06-10 | App-level selection of a specific embedded subtitle stream | NOT APPLICABLE | Embedded rows are cataloged; `_verified_external` intentionally limits MovieVault's explicit selection mode to external subtitle files and delegates embedded-track choice to the player | embedded catalog coverage; VLC/mpv planning tests | No | No | v2.0 locked scope does not require a MovieVault embedded-track-ID selector. Player-native embedded selection is accepted; real VLC/mpv behavior is still verified under Windows acceptance. |
 
 ### SCOPE-07 — Search and filtering
 
@@ -360,6 +360,6 @@ The totals below are derived from the detailed matrix and must be updated togeth
 - PASS — IMPLEMENTED, WINDOWS ACCEPTANCE REQUIRED: **45**
 - PARTIAL — V2.0 BLOCKER: **1**
 - MISSING — V2.0 BLOCKER: **6**
-- REVIEW DECISION NEEDED: **1**
+- REVIEW DECISION NEEDED: **0**
 - DEFERRED — V2.1: **5**
-- NOT APPLICABLE: **0**
+- NOT APPLICABLE: **1**
