@@ -110,6 +110,22 @@ class HostAndHttpSecurityTests(LiveServerCase):
         status,body,_=self.raw('/api/movies?year_from=invalid',host=self.expected_host(),token=self.server.token)
         self.assertEqual(status,400);self.assertIn(b'Invalid production year filter',body)
 
+    def test_delete_root_busy_conflict_is_safe_409_then_retry_succeeds(self):
+        folder=self.base/'watched-root';folder.mkdir()
+        root=self.catalog.add_root(folder)
+        path=f'/api/roots/{root["id"]}'
+        with self.catalog._exclusive_maintenance('p2c_delete_conflict'):
+            status,body,_=self.raw(path,host=self.expected_host(),token=self.server.token,method='DELETE')
+        payload=json.loads(body)
+        self.assertEqual(status,409)
+        self.assertEqual(payload,{'error':'Wait for the current library operation before disabling a source folder'})
+        for leak in ('Traceback',str(self.base),'movievault.sqlite','sqlite3','OperationalError'):
+            self.assertNotIn(leak,body.decode('utf8'))
+        status,body,_=self.raw(path,host=self.expected_host(),token=self.server.token,method='DELETE')
+        self.assertEqual(status,200);self.assertEqual(json.loads(body),{'ok':True})
+        status,body,_=self.raw('/api/bootstrap',host=self.expected_host(),token=self.server.token)
+        self.assertEqual(status,200);self.assertEqual(json.loads(body)['roots'],[])
+
     def test_unexpected_exception_is_generic_and_failure_class_is_diagnostic(self):
         secret=r'C:\Users\Alice\Private Movie.mkv'
         with patch.object(self.catalog,'stats',side_effect=RuntimeError(secret)):

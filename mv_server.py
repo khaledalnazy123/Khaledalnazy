@@ -202,6 +202,7 @@ class Request(BaseHTTPRequestHandler):
                 return self._json({'items':self.server.catalog.remove_subtitle_source(name)})
             if m:self.server.catalog.disable_root(int(m[1]));return self._json({'ok':True})
             self._json({'error':'Unknown route'},404)
+        except BusyError as e:self._expected_error(e,409)
         except (ValidationError,ValueError) as e:self._expected_error(e)
         except Exception as e:self._unexpected_error(e)
     def do_HEAD(self):self._headers('text/plain; charset=utf-8',405,0)

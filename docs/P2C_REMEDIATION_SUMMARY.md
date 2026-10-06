@@ -20,6 +20,8 @@ Implemented:
 - removal of inline styles and event handlers from static and generated UI;
 - generic safe HTTP 500 responses, with only the safe route and exception class
   retained in local diagnostics;
+- consistent safe HTTP 409 handling when an authenticated root-disable DELETE
+  conflicts with exclusive catalog maintenance, followed by normal retry;
 - redaction for JWT-shaped values, drive-letter paths using either separator,
   UNC paths, common Unix/macOS absolute paths, email-like values, and standalone
   movie/subtitle filenames;
@@ -34,10 +36,10 @@ Implemented:
 
 Validation on Linux/Python 3.12.14:
 
-- dedicated P2C: **28/28 passed**, including **3/3** real live-server Chromium
+- dedicated P2C: **29/29 passed**, including **3/3** real live-server Chromium
   E2E tests;
-- full suite: **147/147 passed**;
-- strict full suite with `ResourceWarning` promoted to error: **147/147 passed**;
+- full suite: **148/148 passed**;
+- strict full suite with `ResourceWarning` promoted to error: **148/148 passed**;
 - Python compileall and JavaScript syntax: **passed**;
 - CSP/static audit, raw Host-header probes, adversarial diagnostic ZIP scan,
   backup sensitivity copy checks, and tracked-artifact checks: **passed**;
