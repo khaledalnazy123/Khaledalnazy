@@ -1,6 +1,7 @@
-# Known limitations — MovieVault v2 RC1
+# Known limitations — MovieVault source release candidate
 
 - Windows installer has not been compiled or executed in this Linux build environment. Windows UI integration and DPAPI require real testing on the user's device.
+- Authenticode support is implemented, but this repository contains no signing certificate or private key. A build without external signing configuration is explicitly marked `UNSIGNED`, never presented as signed.
 - The `v1 → v2` importer is intentionally one-way, explicit, preview-first, and allows only a new/empty v2 catalog. It does not merge two nonempty catalogs.
 - v1 external-source paths must still exist on the user's machine for playing/scanning; importing the database does not copy multi-GB movies.
 - IMDb official datasets carry source usage terms. Titles are text metadata, not an image library. IMDb rating values appear after importing official ratings dataset.

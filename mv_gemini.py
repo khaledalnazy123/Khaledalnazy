@@ -8,10 +8,12 @@ import json,re,sys,os,urllib.error,urllib.parse,urllib.request
 from pathlib import Path
 from mv_tmdb import _protect,open_trusted
 
+GEMINI_CREDENTIAL_FILENAME='gemini_credential.dpapi'
+
 class GeminiError(ValueError):pass
 
 class GeminiCredentials:
- def __init__(self,root):self.path=Path(root)/'gemini_credential.dpapi';self._session=''
+ def __init__(self,root):self.path=Path(root)/GEMINI_CREDENTIAL_FILENAME;self._session=''
  def get(self):
   if self._session:return self._session
   if not self.path.is_file():return ''

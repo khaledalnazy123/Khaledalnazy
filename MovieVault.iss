@@ -1,18 +1,26 @@
 #define MyAppName "MovieVault v2"
-#define MyAppVersion "2.0.0"
+#ifndef MyAppVersion
+  #error MyAppVersion must be supplied by build_windows.ps1
+#endif
+#ifndef MyWindowsVersion
+  #error MyWindowsVersion must be supplied by build_windows.ps1
+#endif
+#ifndef MySetupBaseName
+  #error MySetupBaseName must be supplied by build_windows.ps1
+#endif
 #define MyAppPublisher "MovieVault Personal Library"
 #define MyAppExeName "MovieVault.exe"
 [Setup]
 AppId={{C3898D66-FB46-4DD3-9768-8C7A47043F4A}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppVerName=MovieVault 2.0 Release Candidate
+AppVerName=MovieVault {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\MovieVaultV2
 DefaultGroupName=MovieVault v2
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=release
-OutputBaseFilename=MovieVault_Setup_v2.0.0_RC1
+OutputBaseFilename={#MySetupBaseName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -23,7 +31,7 @@ CloseApplications=yes
 RestartApplications=no
 DisableProgramGroupPage=yes
 DirExistsWarning=no
-VersionInfoVersion=2.0.0.1
+VersionInfoVersion={#MyWindowsVersion}
 SetupIconFile=assets\movievault.ico
 LicenseFile=docs\LICENSE.txt
 [Languages]

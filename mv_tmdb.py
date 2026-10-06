@@ -4,6 +4,8 @@ import ctypes, io, json, os, re, sys, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 from ctypes import wintypes
 
+TMDB_CREDENTIAL_FILENAME='tmdb_credential.dpapi'
+
 class TMDbError(ValueError): pass
 
 class _Blob(ctypes.Structure):
@@ -33,7 +35,7 @@ def _protect(raw:bytes, decrypt=False):
     finally:kern.LocalFree(ctypes.cast(out.pbData,ctypes.c_void_p))
 
 class CredentialStore:
-    def __init__(self,root):self.path=Path(root)/'tmdb_credential.dpapi';self._session=None
+    def __init__(self,root):self.path=Path(root)/TMDB_CREDENTIAL_FILENAME;self._session=None
     def get(self):
         if self._session:return self._session
         if not self.path.is_file():return ''

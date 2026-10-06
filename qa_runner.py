@@ -26,7 +26,7 @@ def main():
     py=sys.executable
     steps=[
         ('Unit + integration regression tests',[py,'-m','unittest','discover','-s','tests','-q'],240),
-        ('Python syntax compile',[py,'-m','compileall','-q','mv_core.py','mv_diagnostics.py','mv_gemini.py','mv_migration.py','mv_playback.py','mv_server.py','mv_tmdb.py','MovieVault.pyw','dev.py','tests'],180),
+        ('Python syntax compile',[py,'-m','compileall','-q','mv_version.py','release_tool.py','mv_core.py','mv_diagnostics.py','mv_gemini.py','mv_migration.py','mv_playback.py','mv_server.py','mv_tmdb.py','MovieVault.pyw','dev.py','tests'],180),
     ]
     try:
         import playwright  # noqa

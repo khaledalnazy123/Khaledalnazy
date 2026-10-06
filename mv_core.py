@@ -9,8 +9,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from mv_tmdb import CredentialStore,TMDbClient,TMDbError
 from mv_diagnostics import Diagnostics
 from mv_gemini import GeminiCredentials,GeminiClient,GeminiError
+from mv_version import VERSION
 
-VERSION = '2.0.0-rc.2'
 VIDEO_EXTS = {'.mkv','.mp4','.m4v','.avi','.mov','.wmv','.webm','.mpg','.mpeg','.ts','.m2ts','.flv'}
 SUB_EXTS = {'.srt','.sub','.idx','.ass','.ssa','.sup','.vtt','.smi','.ttml','.pgs'}
 POSTER_NAMES = ('poster.jpg','poster.jpeg','poster.png','folder.jpg','folder.png','movie poster.jpg','cover.jpg','cover.png')

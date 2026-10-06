@@ -1,4 +1,4 @@
-# MovieVault v2 RC2 Feature Ledger
+# MovieVault v2 Feature Ledger (current release is defined by `VERSION`)
 
 ## Implemented in source, tested with automated mocks and/or synthetic media
 - Separate profile from v1, preview/import old v1 data folder/app folder/database/Backup ZIP, staged restart migration, legacy schema upgrade; source remains read-only
@@ -17,9 +17,9 @@
 - Soft Light visual consistency needs real WebView2/monitor review
 - Live external API, rate limits and Windows DPAPI need actual connected-user acceptance tests
 - ffmpeg custom frame design: quality depends on selected source scene
-- Windows installer/portable packaging scripts created, not yet built on Windows
+- Deterministic Windows release scripts, exact hashed locks, provenance/SBOM/manifest verification, and Authenticode path are implemented; native artifacts are not yet built or accepted on Windows
 
-## Deferred after RC2 stabilization
+## Deferred until after release-candidate stabilization
 - Group multiple editions of one movie under one poster card
 - Dedicated duplicate-management interface and detailed Recently Watched timeline
 - Fully automated Windows desktop installer UI E2E testing on a Windows runner
