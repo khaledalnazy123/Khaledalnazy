@@ -26,6 +26,7 @@
 .subtitle-filename { width:160px; max-width:160px; }
 @media(max-width:1050px) {.detail-extra:has(.subtable-scroll) {grid-template-columns: minmax(0,1fr);} }
 .mini-cancel{margin-left:12px;padding:4px 9px;border:1px solid #815366;border-radius:5px;background:#432437;color:#ffe1e8;font-size:11px}
+.meter{display:block;width:100%;border:0;appearance:none}.meter::-webkit-progress-bar{background:#1c2c42;border-radius:6px}.meter::-webkit-progress-value{background:linear-gradient(90deg,#1a88fc,#0752d4);border-radius:6px}.meter::-moz-progress-bar{background:linear-gradient(90deg,#1a88fc,#0752d4);border-radius:6px}.tmdb-mark{color:#39b4c6;margin-right:9px}.mt8{margin-top:8px}.mt9{margin-top:9px}.grow1{flex:1}.grow2{flex:2}.backup-warning{margin:12px 0;padding:10px;border:1px solid #8e6630;border-radius:7px;background:#382917;color:#ffd995;font-size:12px;line-height:1.45}
 /* Softer optional palettes; do not replace the product's default cinematic theme. */
 [data-theme='light'] .app-shell{background:#eef2f6;color:#203247}
 [data-theme='light'] .topbar,[data-theme='light'] footer{background:#dce7f0;color:#314f6c;border-color:#c0cfde}

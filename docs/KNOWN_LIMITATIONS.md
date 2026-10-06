@@ -11,3 +11,4 @@
 - Multiple Editions merging, an independent Duplicate Detector screen, and detailed Recently Watched remain planned instead of falsely marked complete.
 - Screenshot generator depends on ffmpeg.exe available in vendor or PATH; if unavailable it reports a clear error.
 - Only synthetic/fictional test assets have been used during current automated regression tests; no real user's movie collection or tokens were included.
+- Full library backups are intentionally portable but are not encrypted or anonymized. They exclude movie video files and TMDb/Gemini credentials, but contain filenames, watched-folder paths, notes, and other catalog metadata and must be handled as sensitive personal data.
