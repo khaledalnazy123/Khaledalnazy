@@ -1,5 +1,0 @@
-Home: cards= 3 errors= []
-Settings: migration= True gemini= True errors= []
-Details:  Dont Look Up (2021) subtitle rows= 2 errors= []
-Closing edit returns movie: 1
-VISUAL SMOKE PASSED

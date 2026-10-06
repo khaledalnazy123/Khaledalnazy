@@ -1,8 +1,10 @@
 """Browser-only UI smoke using stubbed API, no user data and no network."""
-import json,re,sys
+import json,os,re,sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 HERE=Path(__file__).parents[1]
+OUTPUT=Path(os.environ.get('MOVIEVAULT_QA_ARTIFACT_DIR',HERE/'qa_reports'/'visual'))
+OUTPUT.mkdir(parents=True,exist_ok=True)
 sys.path.insert(0,str(HERE))
 from mv_version import VERSION
 html=(HERE/'web/index.html').read_text().replace('{{APP_VERSION}}',VERSION).replace('{{APP_TOKEN}}','testing')
@@ -24,12 +26,12 @@ with sync_playwright() as p:
  page.wait_for_timeout(700)
  print('Home: cards=',page.locator('.movie-card').count(),'errors=',errors)
  assert page.locator('.movie-card').count()==3,errors
- page.screenshot(path=str(HERE/'docs/V2_Home_UI_Test.png'),full_page=True)
+ page.screenshot(path=str(OUTPUT/'V2_Home_UI_Test.png'),full_page=True)
  assert page.locator('#updateAllBtn').is_visible()
  page.locator('.nav[data-view=settings]').click();page.wait_for_timeout(250)
  print('Settings: migration=',page.locator('#migrationPanel').is_visible(),'gemini=',page.locator('#geminiPanel').is_visible(),'errors=',errors)
  assert page.locator('#migrationPanel').is_visible() and page.locator('#geminiPanel').is_visible()
- page.screenshot(path=str(HERE/'docs/V2_Settings_UI_Test.png'),full_page=True)
+ page.screenshot(path=str(OUTPUT/'V2_Settings_UI_Test.png'),full_page=True)
  page.locator('#themeChoice').select_option('light');page.wait_for_timeout(80)
  assert page.evaluate('document.documentElement.dataset.theme')=='light'
  page.locator('#themeChoice').select_option('dark')
@@ -37,7 +39,7 @@ with sync_playwright() as p:
  page.locator('.movie-card').first.click();page.wait_for_timeout(300)
  print('Details: ',page.locator('#modalContent h2').first.text_content(),'subtitle rows=',page.locator('[data-apply-sub]').count(),'errors=',errors)
  assert page.locator('[data-apply-sub]').count()==2,errors
- page.screenshot(path=str(HERE/'docs/V2_Movie_Details_UI_Test.png'),full_page=True)
+ page.screenshot(path=str(OUTPUT/'V2_Movie_Details_UI_Test.png'),full_page=True)
  page.locator('#editMovie').click();page.wait_for_timeout(200)
  page.locator('#modalOverlay').click(position={'x':5,'y':5});page.wait_for_timeout(250)
  print('Closing edit returns movie:',page.locator('#modalContent .detail-title').count())

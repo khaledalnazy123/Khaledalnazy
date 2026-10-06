@@ -4,6 +4,7 @@ import json,mimetypes,os,re,secrets,subprocess,sys,threading,urllib.parse,webbro
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from mv_core import Catalog,BusyError,ValidationError,VERSION,default_data_dir
+from mv_diagnostics import _safe
 from mv_playback import playback_plan,launch_playback,PlaybackError,SubtitleChoiceRequired
 from mv_migration import legacy_data_dir,resolve_legacy_source,stage_migration,apply_pending_migration,MigrationError
 
@@ -28,13 +29,21 @@ class MovieServer(ThreadingHTTPServer):
 class Request(BaseHTTPRequestHandler):
     server:MovieServer
     def log_message(self,fmt,*args):pass
+    def parse_request(self):
+        if not super().parse_request():return False
+        try:self._require_valid_host()
+        except ValidationError as error:
+            self._expected_error(error)
+            return False
+        return True
     def _headers(self,ctype,code=200,size=None):
         self.send_response(code)
         self.send_header('Content-Type',ctype)
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','no-referrer')
         self.send_header('Cache-Control','no-store')
-        self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data: blob: https://www.themoviedb.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header('X-Frame-Options','DENY')
         if size is not None:self.send_header('Content-Length',str(size))
         self.end_headers()
         # Activity records do not contain query parameters or request bodies.
@@ -44,8 +53,20 @@ class Request(BaseHTTPRequestHandler):
     def _json(self,d,code=200):
         raw=json.dumps(d,ensure_ascii=False,default=str).encode('utf-8');self._headers('application/json; charset=utf-8',code,len(raw));self.wfile.write(raw)
     def _bytes(self,b,mime):self._headers(mime,200,len(b));self.wfile.write(b)
+    def _require_valid_host(self):
+        # Host protects the token-bearing bootstrap page as well as API routes.
+        values=self.headers.get_all('Host',failobj=[])
+        port=self.server.server_port
+        if len(values)!=1 or values[0].lower() not in {f'127.0.0.1:{port}',f'localhost:{port}'}:
+            raise ValidationError('Invalid host')
+    def _expected_error(self,error,code=400):
+        return self._json({'error':_safe(str(error))},code)
+    def _unexpected_error(self,error):
+        path=urllib.parse.urlsplit(self.path).path
+        try:self.server.catalog.diagnostics.event('http_request_failed',route=path,failure_type=type(error).__name__)
+        except OSError:pass
+        return self._json({'error':'Internal server error'},500)
     def _auth(self):
-        if self.headers.get('Host','') not in (f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'):raise ValidationError('Invalid host')
         if self.headers.get('X-MovieVault-Token')!=self.server.token:raise ValidationError('Unauthorized client')
         origin=self.headers.get('Origin')
         if origin and origin not in (f'http://127.0.0.1:{self.server.server_port}',f'http://localhost:{self.server.server_port}'):
@@ -101,8 +122,8 @@ class Request(BaseHTTPRequestHandler):
                 if data:return self._bytes(data,'image/jpeg')
                 return self._headers('image/jpeg',404)
             self._json({'error':'Not found'},404)
-        except (ValidationError,MigrationError,ValueError,KeyError) as e:self._json({'error':str(e)},400)
-        except Exception as e:self._json({'error':'Internal error: '+str(e)[:120]},500)
+        except (ValidationError,MigrationError,ValueError,KeyError) as e:self._expected_error(e)
+        except Exception as e:self._unexpected_error(e)
     def do_POST(self):
         try:
             self._auth();path=urllib.parse.urlsplit(self.path).path;cat=self.server.catalog
@@ -159,9 +180,9 @@ class Request(BaseHTTPRequestHandler):
                 except SubtitleChoiceRequired:
                     return self._json({'error':'Choose a subtitle for this movie.','needs_selection':True,'subtitles':[{'id':s['id'],'language':s['language'],'source':s['source'],'filename':s['filename'],'kind':s['kind']} for s in d['subtitles']]},409)
             self._json({'error':'Unknown route'},404)
-        except BusyError as e:self._json({'error':str(e)},409)
-        except (ValidationError,MigrationError,PlaybackError,ValueError,KeyError,TypeError,json.JSONDecodeError) as e:self._json({'error':str(e)},400)
-        except Exception as e:self._json({'error':'Internal error: '+str(e)[:120]},500)
+        except BusyError as e:self._expected_error(e,409)
+        except (ValidationError,MigrationError,PlaybackError,ValueError,KeyError,TypeError,json.JSONDecodeError) as e:self._expected_error(e)
+        except Exception as e:self._unexpected_error(e)
     def do_PATCH(self):
         try:
             self._auth();path=urllib.parse.urlsplit(self.path).path;cat=self.server.catalog;b=self._body()
@@ -171,8 +192,8 @@ class Request(BaseHTTPRequestHandler):
             if m:
                 cat.patch_subtitle(int(m[1]),b);return self._json({'ok':True})
             self._json({'error':'Unknown route'},404)
-        except (ValidationError,MigrationError,ValueError,KeyError) as e:self._json({'error':str(e)},400)
-        except Exception as e:self._json({'error':'Internal error: '+str(e)[:120]},500)
+        except (ValidationError,MigrationError,ValueError,KeyError) as e:self._expected_error(e)
+        except Exception as e:self._unexpected_error(e)
     def do_DELETE(self):
         try:
             self._auth();parsed=urllib.parse.urlsplit(self.path);m=re.fullmatch(r'/api/roots/(\d+)',parsed.path)
@@ -181,8 +202,10 @@ class Request(BaseHTTPRequestHandler):
                 return self._json({'items':self.server.catalog.remove_subtitle_source(name)})
             if m:self.server.catalog.disable_root(int(m[1]));return self._json({'ok':True})
             self._json({'error':'Unknown route'},404)
-        except (ValidationError,ValueError) as e:self._json({'error':str(e)},400)
-        except Exception as e:self._json({'error':'Internal error: '+str(e)[:120]},500)
+        except (ValidationError,ValueError) as e:self._expected_error(e)
+        except Exception as e:self._unexpected_error(e)
+    def do_HEAD(self):self._headers('text/plain; charset=utf-8',405,0)
+    def do_OPTIONS(self):self._headers('text/plain; charset=utf-8',405,0)
 
 class DesktopApi:
     def __init__(self):

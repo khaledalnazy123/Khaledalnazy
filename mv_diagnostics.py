@@ -16,9 +16,13 @@ def _safe(value):
     text=str(value)[:350]
     text=re.sub(r'(?i)bearer\s+\S+','[REDACTED AUTH]',text)
     text=re.sub(r'AIza[A-Za-z0-9_-]{20,}','[REDACTED GEMINI KEY]',text)
+    text=re.sub(r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])','[REDACTED JWT]',text)
     text=re.sub(r'(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*\S+',r'\1=[REDACTED]',text)
-    text=re.sub(r'(?i)[a-z]:\\\\users\\\\[^\\\\\s]+',r'[REDACTED USER DIRECTORY]',text)
-    text=re.sub(r'/home/[^/\s]+',r'/home/[REDACTED]',text)
+    text=re.sub(r'(?i)[A-Z]:[\\/][^,\r\n\t;<>|]*','[REDACTED PATH]',text)
+    text=re.sub(r'\\\\[^\\/\s]+[\\/][^,\r\n\t;<>|]+','[REDACTED UNC PATH]',text)
+    text=re.sub(r'(?<![A-Za-z0-9])/(?:home|Users|Volumes|mnt|media|private|tmp|var|opt|Library|Applications)/[^,\r\n\t;<>|]*','[REDACTED PATH]',text)
+    text=re.sub(r'(?i)[^,\r\n\t/\\;<>|]*\.(?:mkv|mp4|avi|mov|wmv|m4v|ts|srt|ass|ssa|vtt|sub)(?![A-Za-z0-9])','[REDACTED FILENAME]',text)
+    text=re.sub(r'(?i)(?<![A-Z0-9._%+\-])[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}(?![A-Z0-9._%+\-])','[REDACTED EMAIL]',text)
     return text
 
 class Diagnostics:
