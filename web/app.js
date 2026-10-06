@@ -3,6 +3,7 @@ const TOKEN=document.querySelector('meta[name="mv-token"]').content;
 const $=id=>document.getElementById(id);
 let migrationPreview=null;
 let state={view:'home',filter:'all',q:'',sort:'recent',page:1,limit:54,total:0,config:{},movie:null,job:null,groups:[],group:'',subtitleSources:['Unknown','Netflix','OSN','Amazon Prime Video','Disney+','Manual','Other'],modalBackMovieId:null};
+const ADVANCED_FILTER_FIELDS=Object.freeze({genre:'fGenre',actor:'fActor',imdb_rating_min:'fImdbRatingMin',imdb_rating_max:'fImdbRatingMax',personal_rating_min:'fPersonalRatingMin',personal_rating_max:'fPersonalRatingMax',watched:'fWatched',video_codec:'fVideoCodec',overall_bitrate_min_kbps:'fBitrateMin',overall_bitrate_max_kbps:'fBitrateMax',source:'fMovieSource',subtitle_language:'fSubtitleLanguage',subtitle_source:'fSubtitleSource',translator:'fTranslator',subtitle_quality:'fSubtitleQuality',year_from:'fYearFrom',year_to:'fYearTo',favorite:'fFavorite'});
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const size=b=>{if(b==null)return '—';let n=Number(b),u=['B','KB','GB','TB'];if(n<1024)return `${n} B`;let unit='MB';n/=1024;if(n>=1024){n/=1024;unit='MB';}else{unit='KB';}if(n>=1024){n/=1024;unit='GB';}if(n>=1024){n/=1024;unit='TB';}return `${n.toFixed(n>=100?0:n>=10?1:2)} ${unit}`};
 const bit=b=>b?`${Number(b/1000).toLocaleString(undefined,{maximumFractionDigits:0})} kbps`:'Not available';
@@ -24,7 +25,7 @@ if(data.active_job&&data.active_job.state==='running')watchJob(data.active_job.i
 async function refreshBase(){let d=await api('/api/bootstrap');updateSidebar(d);return d;}
 function queryOptions(){const status=state.view==='archived'?(state.filter==='offline'?'offline':'missing'):(state.filter==='missing'||state.filter==='offline'?state.filter:'');let quality=['4K','1080p','720p','arabic_subs','no_subs','poster_missing'].includes(state.filter)?state.filter:'';
 const args=new URLSearchParams({q:state.group?'':state.q,status,quality,sort:state.sort,page:state.page,limit:state.limit});if(state.group)args.set('release_group',state.group);
-for(const [field,id] of Object.entries({genre:'fGenre',actor:'fActor',subtitle_language:'fSubtitleLanguage',subtitle_source:'fSubtitleSource',translator:'fTranslator',year_from:'fYearFrom',year_to:'fYearTo',favorite:'fFavorite'})){const value=$(id).value.trim();if(value)args.set(field,value);}
+for(const [field,id] of Object.entries(ADVANCED_FILTER_FIELDS)){const value=$(id).value.trim();if(value)args.set(field,value);}
 return args.toString();}
 async function refreshMovies(){const result=await api('/api/movies?'+queryOptions());state.total=result.total;$('countLabel').textContent=result.total.toLocaleString()+' movies';$('pageLabel').textContent=`Page ${state.page} / ${Math.max(1,Math.ceil(result.total/state.limit))}`;$('prevBtn').disabled=state.page<=1;$('nextBtn').disabled=state.page*state.limit>=result.total;
 $('movieGrid').innerHTML=result.items.length?result.items.map(movieCard).join(''):'<div class="empty-state"><strong>No movies here yet</strong><p>Add a movie folder and press Scan Library, or change your filters.</p><button class="primary" id="emptyAdd">+ Add movie folder</button></div>';
@@ -104,8 +105,8 @@ $('diagnosticExport').onclick=()=>safe(async()=>{let r=await api('/api/diagnosti
 $('addSubtitleSource').onclick=()=>safe(async()=>{const name=$('newSubtitleSource').value.trim();if(!name)throw Error('Enter a subtitle provider/translator name.');await api('/api/subtitle-sources','POST',{name});$('newSubtitleSource').value='';await loadSubtitleSources();toast('Custom source added.');});
 $('defaultSubLang').onchange=()=>safe(async()=>{await api('/api/settings','POST',{default_external_subtitle_lang:$('defaultSubLang').value});toast('Default subtitle language saved.');});
 $('themeChoice').onchange=()=>safe(async()=>{await api('/api/settings','POST',{theme:$('themeChoice').value});document.documentElement.dataset.theme=$('themeChoice').value;toast('Theme saved.');});
-for(const id of ['fGenre','fActor','fSubtitleLanguage','fSubtitleSource','fTranslator','fYearFrom','fYearTo','fFavorite']){let el=$(id);el.addEventListener(['fGenre','fActor','fTranslator','fYearFrom','fYearTo'].includes(id)?'input':'change',()=>{state.page=1;clearTimeout(window.filterTimer);window.filterTimer=setTimeout(()=>safe(refreshMovies),200);});}
-$('clearAdvancedFilters').onclick=()=>{for(const id of ['fGenre','fActor','fSubtitleLanguage','fSubtitleSource','fTranslator','fYearFrom','fYearTo','fFavorite'])$(id).value='';state.page=1;safe(refreshMovies);};
+for(const id of Object.values(ADVANCED_FILTER_FIELDS)){let el=$(id);el.addEventListener(el.tagName==='SELECT'?'change':'input',()=>{state.page=1;clearTimeout(window.filterTimer);window.filterTimer=setTimeout(()=>safe(refreshMovies),200);});}
+$('clearAdvancedFilters').onclick=()=>{for(const id of Object.values(ADVANCED_FILTER_FIELDS))$(id).value='';state.page=1;safe(refreshMovies);};
 $('legacyDetect').onclick=()=>safe(async()=>showLegacy(await api('/api/migration/detect')));
 $('legacyPreview').onclick=()=>safe(async()=>showLegacy(await api('/api/migration/preview','POST',{path:$('legacyPath').value.trim()})));
 $('legacyImport').onclick=()=>safe(async()=>{if(!migrationPreview)throw Error('Preview the previous library first.');

@@ -623,9 +623,25 @@ class Catalog:
     def groups(self):
         with self.connect() as c:
             return [dict(r) for r in c.execute("SELECT MIN(release_group) AS 'group',COUNT(*) AS count FROM movies WHERE release_group<>'' GROUP BY release_group COLLATE NOCASE ORDER BY count DESC,MIN(release_group) COLLATE NOCASE,MIN(release_group) LIMIT 100")]
-    def movies(self,q='',status='',quality='',sort='recent',page=1,limit=54, genre='',subtitle_language='',subtitle_source='',translator='',actor='',year_from=None,year_to=None,favorite='',watched='',release_group=''):
+    def movies(self,q='',status='',quality='',sort='recent',page=1,limit=54, genre='',subtitle_language='',subtitle_source='',translator='',subtitle_quality='',actor='',year_from=None,year_to=None,favorite='',watched='',release_group='',imdb_rating_min=None,imdb_rating_max=None,personal_rating_min=None,personal_rating_max=None,video_codec='',overall_bitrate_min_kbps=None,overall_bitrate_max_kbps=None,source=''):
         page=max(1,int(page));limit=min(max(1,int(limit)),150)
         where=[];args=[]
+        def numeric_range(column,label,minimum,maximum,lowest,highest,multiplier=1):
+            def bound(value,kind):
+                if value is None or (isinstance(value,str) and not value.strip()):return None
+                try:number=float(value)
+                except (TypeError,ValueError,OverflowError):raise ValidationError(f'Invalid {label} {kind}') from None
+                if not math.isfinite(number) or number<lowest or number>highest:raise ValidationError(f'Invalid {label} {kind}')
+                return number
+            low=bound(minimum,'minimum');high=bound(maximum,'maximum')
+            if low is not None and high is not None and low>high:raise ValidationError(f'{label} minimum cannot exceed maximum')
+            if low is not None:where.append(column+'>=?');args.append(low*multiplier)
+            if high is not None:where.append(column+'<=?');args.append(high*multiplier)
+        numeric_range('imdb_rating','IMDb rating',imdb_rating_min,imdb_rating_max,0,10)
+        numeric_range('personal_rating','personal rating',personal_rating_min,personal_rating_max,0,10)
+        # Public/API units are kbps; SQLite stores the inclusive comparison value in bps.
+        # Estimated and measured overall bitrates intentionally use the same stored field.
+        numeric_range('overall_bitrate','overall bitrate',overall_bitrate_min_kbps,overall_bitrate_max_kbps,0,10_000_000,1000)
         if q:
             where.append("(LOWER(display_title) LIKE ? ESCAPE '\\' OR LOWER(original_filename) LIKE ? ESCAPE '\\' OR LOWER(release_group) LIKE ? ESCAPE '\\' OR LOWER(genres) LIKE ? ESCAPE '\\' OR LOWER(cast_names) LIKE ? ESCAPE '\\' OR CAST(year AS TEXT) LIKE ? ESCAPE '\\')")
             key='%'+str(q).lower().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%';args.extend([key]*6)
@@ -641,12 +657,22 @@ class Catalog:
                 where.append('('+ ' OR '.join("(','||REPLACE(LOWER(genres),' ','')||',') LIKE ?" for _ in genres)+')')
                 args.extend([f'%,{g.replace(" ","")},%' for g in genres])
         if actor:where.append('LOWER(cast_names) LIKE ?');args.append('%'+str(actor).lower().replace('%','').replace('_','')+'%')
-        # Use a SINGLE correlated subtitle row when combining language/source/translator.
+        codec=str(video_codec).strip()
+        if len(codec)>80:raise ValidationError('Invalid video codec filter')
+        if codec:where.append('TRIM(video_codec)=? COLLATE NOCASE');args.append(codec)
+        movie_source=str(source).strip()
+        if len(movie_source)>120:raise ValidationError('Invalid movie source filter')
+        if movie_source:where.append('TRIM(source)=? COLLATE NOCASE');args.append(movie_source)
+        # Use a SINGLE correlated subtitle row when combining language/source/translator/quality.
         # Netflix English + OSN Arabic must not pass Netflix AND Arabic together.
         clauses=[];sargs=[]
         if subtitle_language:clauses.append('s.language=?');sargs.append(str(subtitle_language))
         if subtitle_source:clauses.append('s.source=? COLLATE NOCASE');sargs.append(str(subtitle_source))
         if translator:clauses.append('s.translator LIKE ?');sargs.append('%'+str(translator).replace('%','').replace('_','')+'%')
+        if subtitle_quality:
+            value=str(subtitle_quality).strip()
+            if len(value)>80:raise ValidationError('Invalid subtitle quality filter')
+            clauses.append('s.quality=? COLLATE NOCASE');sargs.append(value)
         if clauses:where.append('EXISTS(SELECT 1 FROM subtitles s WHERE s.movie_id=movies.id AND '+' AND '.join(clauses)+')');args.extend(sargs)
         for key,val,op in [('year_from',year_from,'>='),('year_to',year_to,'<=')]:
             if val not in ('',None):
