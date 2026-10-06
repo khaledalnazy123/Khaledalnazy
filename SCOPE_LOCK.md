@@ -6,19 +6,15 @@ Audited baseline: `origin/main` at `150616e654379cb4c28bf522b65991183d5ede73`
 
 Audit branch: `audit/v2-scope-lock`
 
+Filter-completion baseline: `origin/main` at `a7b7a5774a48516f0afadf6fbf91e151fc194f65`
+
+Filter-completion branch: `fix/v2-filter-completion`
+
 This is a source-and-automation audit, not a Stable-release declaration. Evidence was taken from the implementation, HTTP layer, frontend, persistence behavior, automated tests, and release scripts. Documentation and test counts were not treated as substitutes for implementation.
 
 ## A. V2.0 SOURCE BLOCKERS
 
-| ID | Exact missing behavior | Missing layer | Minimal remediation | Likely files | Required regression coverage | Risk |
-|---|---|---|---|---|---|---|
-| S07-05 | Users cannot filter the catalog by an IMDb-rating value/range. IMDb sorting is not filtering. | Both backend and UI | Add validated rating bounds to the catalog/API query and expose usable controls. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Boundary, range, null-rating, composition, API-validation, and UI-wiring tests. | Medium |
-| S07-06 | Users cannot filter by their personal rating. The value can be edited and persisted, but not filtered. | Both backend and UI | Add validated personal-rating bounds and UI controls. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Boundary, range, unrated, composition, persistence, and UI-wiring tests. | Medium |
-| S07-08 | The backend accepts `watched`, but no watched filter is exposed or sent by the frontend. | UI | Add an All/Watched/Unwatched control and include it in `queryOptions()` and clear/reset behavior. | `web/index.html`, `web/app.js`, `tests/test_v2_ui_contract.py` | UI query serialization, clear/reset, watched/unwatched, and compound-filter tests. | Low |
-| S07-10 | Users cannot filter by video codec. | Both backend and UI | Add a normalized/exact codec query and user-facing control populated or documented consistently. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Case/normalization, unknown codec, exactness, composition, and UI-wiring tests. | Medium |
-| S07-11 | Users cannot filter by video/overall bitrate. | Both backend and UI | Define and implement validated bitrate range semantics and expose controls with clear units. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Bounds, units, null/estimated bitrate policy, invalid input, composition, and UI tests. | Medium |
-| S07-12 | Users cannot filter by movie source. Search does not include `source`, and the release-group filter is a different concept. | Both backend and UI | Add source filtering and a user-facing control without changing broad `q` semantics. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Exact/normalized source, distinct release group, composition, and UI-wiring tests. | Medium |
-| S07-17 | Users cannot filter by subtitle translation quality. Quality is editable, but neither the subtitle-row quality nor the movie default is queryable. | Both backend and UI | Add a subtitle-quality predicate to the correlated subtitle filter and expose it in Advanced Filters. | `mv_core.py`, `mv_server.py`, `web/index.html`, `web/app.js` | Same-row language/source/translator/quality correlation, custom values, composition, and UI tests. | Medium |
+None. S07-05, S07-06, S07-08, S07-10, S07-11, S07-12, and S07-17 are implemented through the catalog query, HTTP API, and Advanced Filters UI, with focused regression coverage in `tests/test_v2_filters.py` and UI contract coverage in `tests/test_v2_ui_contract.py`.
 
 ## B. WINDOWS ACCEPTANCE PENDING
 
@@ -39,9 +35,9 @@ S21-01 through S21-05 remain explicitly outside the v2.0 Stable source gate: gro
 
 ## D. RELEASE DECISION
 
-**SOURCE SCOPE NOT COMPLETE — TARGETED FIXES REQUIRED BEFORE WINDOWS ACCEPTANCE**
+**SOURCE SCOPE COMPLETE — READY FOR WINDOWS ACCEPTANCE**
 
-The seven source blockers above must be remediated and tested before the native-Windows acceptance gate. S06-10 is resolved as **NOT APPLICABLE** to an app-level embedded-track selector in v2.0: the locked scope requires embedded subtitle cataloging plus preferred playback behavior and explicit external-subtitle selection, while embedded stream choice may remain player-native. Real player behavior remains covered by the VLC/mpv Windows acceptance gate.
+The seven filter blockers are implemented and regression-tested. S06-10 remains resolved as **NOT APPLICABLE** to an app-level embedded-track selector in v2.0: the locked scope requires embedded subtitle cataloging plus preferred playback behavior and explicit external-subtitle selection, while embedded stream choice may remain player-native. Real player behavior remains covered by the VLC/mpv Windows acceptance gate.
 
 ## Detailed requirement matrix
 
@@ -79,7 +75,7 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 |---|---|---|---|---|---|---|---|
 | S02-01 | File size | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `movies.size_bytes`; details UI | catalog scan tests; `P2APerformanceTests.test_raw_probe_snapshot_is_valid_bounded_and_keeps_useful_metadata` | No | No | From filesystem stat. |
 | S02-02 | Resolution | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; resolution fields and tags | scan/metadata tests | No | No | Verified dimensions retained separately from filename hint. |
-| S02-03 | Video codec | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `video_codec`; Full Info | metadata/scan tests | No | No | Retained even though its required filter is missing (S07-10). |
+| S02-03 | Video codec | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `video_codec`; Full Info | metadata/scan tests | No | No | Retained and user-filterable through S07-10. |
 | S02-04 | Video bitrate | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `video_bitrate`; estimate marker | P2A raw-probe test; visual smoke | No | No | Presentation labels estimates. |
 | S02-05 | Audio codec | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `audio_codec` | metadata/scan tests | No | No | — |
 | S02-06 | Audio bitrate | PASS — IMPLEMENTED & AUTOMATED | `media_summary`; `audio_bitrate` | metadata/scan tests | No | No | — |
@@ -103,7 +99,7 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 | S03-03 | Genre | PASS — IMPLEMENTED & AUTOMATED | `genres`, TMDb refresh, edit UI | V2 feature filter/edit tests | No | No | — |
 | S03-04 | IMDb ID | PASS — IMPLEMENTED & AUTOMATED | `imdb_id`; exact matching; manual lock semantics | P1B identity/rating tests | No | No | Manual ID controls rating identity. |
 | S03-05 | IMDb URL/access | PASS — IMPLEMENTED & AUTOMATED | details UI emits `imdb.com/title/<id>/` with `noopener` | visual/browser smoke | No | No | URL is derived from validated tconst. |
-| S03-06 | IMDb rating | PASS — IMPLEMENTED & AUTOMATED | `imdb_ratings`; `imdb_rating`; card/details UI | `MetadataTests.test_imdb_ratings_are_real_official_file_not_tmdb_average`; P1B tests | No | No | Required filtering is separately missing at S07-05. |
+| S03-06 | IMDb rating | PASS — IMPLEMENTED & AUTOMATED | `imdb_ratings`; `imdb_rating`; card/details UI | `MetadataTests.test_imdb_ratings_are_real_official_file_not_tmdb_average`; P1B tests | No | No | User-accessible numeric filtering is covered by S07-05. |
 | S03-07 | Cast | PASS — IMPLEMENTED & AUTOMATED | TMDb detail refresh stores `cast_names`; details UI | `MetadataTests.test_verified_tmdb_cast_is_separate_from_imdb_rating` | Yes, live TMDb | No | Provider call needs Windows acceptance. |
 | S03-08 | Overview/description | PASS — IMPLEMENTED & AUTOMATED | TMDb detail refresh stores `overview`; details UI | TMDb metadata tests | Yes, live TMDb | No | — |
 | S03-09 | Official IMDb offline title dataset | PASS — IMPLEMENTED & AUTOMATED | bounded `_imdb_import_impl`; settings UI/manual title file | import, cancellation, and P2A bound tests | No | No | Transactional live replacement. |
@@ -138,7 +134,7 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 | S05-05 | External/embedded kind metadata | PASS — IMPLEMENTED & AUTOMATED | subtitles `kind`; UI table | V2 feature tests | No | No | — |
 | S05-06 | Subtitle source/provider metadata | PASS — IMPLEMENTED & AUTOMATED | inference, custom sources, per-row editor | V2 feature tests | No | No | Kept separate from movie source. |
 | S05-07 | Subtitle translator/group metadata | PASS — IMPLEMENTED & AUTOMATED | `translator`; row editor/filter | V2 feature tests | No | No | — |
-| S05-08 | Subtitle quality metadata | PASS — IMPLEMENTED & AUTOMATED | `quality`; row/default editor | manual subtitle rescan test | No | No | Required filter is missing at S07-17. |
+| S05-08 | Subtitle quality metadata | PASS — IMPLEMENTED & AUTOMATED | `quality`; row/default editor | manual subtitle rescan test | No | No | User-accessible same-row filtering is covered by S07-17. |
 | S05-09 | Recognized Netflix/OSN/Amazon/Disney+/BluRay/WEB-DL and custom provider values | PASS — IMPLEMENTED & AUTOMATED | `DEFAULT_SUBTITLE_SOURCES`; filename inference; `add_subtitle_source` | `test_custom_sources_and_theme`; same-row filter test | No | No | Custom-source removal has backend support; removal UI is not required by scope. |
 | S05-10 | Unknown external subtitle defaults to Arabic unless configured otherwise | PASS — IMPLEMENTED & AUTOMATED | `default_external_subtitle_lang`; settings UI | `test_default_unknown_external_is_arabic`; theme/settings test | No | No | Arabic/English/Unknown are exposed. |
 | S05-11 | Manual subtitle metadata survives rescans | PASS — IMPLEMENTED & AUTOMATED | `_sync_subtitles` preserves manual fields | `test_manual_language_survives_rescan` | No | No | Language, source, translator and quality persist. |
@@ -166,22 +162,22 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 | S07-02 | User-accessible actor filter | PASS — IMPLEMENTED & AUTOMATED | `fActor`; API parameter; cast predicate | V2 advanced-filter test | No | No | — |
 | S07-03 | User-accessible genre filter | PASS — IMPLEMENTED & AUTOMATED | `fGenre`; API parameter; genre predicate | V2 advanced-filter test | No | No | — |
 | S07-04 | User-accessible year filter | PASS — IMPLEMENTED & AUTOMATED | from/to controls, validated API/catalog bounds | V2 advanced-filter and P2C safe-validation tests | No | No | — |
-| S07-05 | User-accessible IMDb-rating filter | MISSING — V2.0 BLOCKER | Rating is stored and sortable, but `Catalog.movies`, API and UI have no rating predicate/control | No filter regression exists | No | Yes | Both backend and UI missing. |
-| S07-06 | User-accessible personal-rating filter | MISSING — V2.0 BLOCKER | `personal_rating` is editable/persistent only; absent from query/API/UI filters | No filter regression exists | No | Yes | Both backend and UI missing. |
+| S07-05 | User-accessible IMDb-rating filter | PASS — IMPLEMENTED & AUTOMATED | Inclusive validated `imdb_rating_min/max` catalog/API predicates and Advanced Filters controls | `FilterCompletionTests.test_imdb_rating_min_max_range_null_and_validation`; live API composition test | No | No | Scale 0–10; NULL ratings do not match numeric ranges. |
+| S07-06 | User-accessible personal-rating filter | PASS — IMPLEMENTED & AUTOMATED | Inclusive validated `personal_rating_min/max` catalog/API predicates and Advanced Filters controls | `FilterCompletionTests.test_personal_rating_min_max_range_null_and_validation`; live API composition test | No | No | Scale 0–10; unrated movies do not match numeric ranges. |
 | S07-07 | User-accessible favorite filter | PASS — IMPLEMENTED & AUTOMATED | `fFavorite`; query/API/catalog predicate | V2 advanced-filter test | No | No | Supports favorites and non-favorites. |
-| S07-08 | User-accessible watched filter | PARTIAL — V2.0 BLOCKER | `Catalog.movies(watched=...)` and server pass-through exist; no frontend control or serialization | Backend behavior only; no UI contract | No | Yes | UI half is missing. |
+| S07-08 | User-accessible watched filter | PASS — IMPLEMENTED & AUTOMATED | All/Watched/Unwatched selector serializes the existing `watched` API predicate and participates in Clear Filters | `FilterCompletionTests.test_watched_and_unwatched`; UI mapping/clear tests | No | No | Supports explicit watched and unwatched states. |
 | S07-09 | User-accessible resolution filter | PASS — IMPLEMENTED & AUTOMATED | 4K/1080p/720p chips; `quality` mapping; persisted resolution | catalog/browser tests | No | No | Locked scope requires the concept, not every possible resolution as a separate chip. |
-| S07-10 | User-accessible video-codec filter | MISSING — V2.0 BLOCKER | Codec is persisted/displayed but absent from query/API/UI filters | No filter regression exists | No | Yes | Both backend and UI missing. |
-| S07-11 | User-accessible bitrate filter | MISSING — V2.0 BLOCKER | Bitrates are persisted/displayed but absent from query/API/UI filters | No filter regression exists | No | Yes | Both backend and UI missing; units/range semantics must be defined. |
-| S07-12 | User-accessible movie-source filter | MISSING — V2.0 BLOCKER | Source is persisted/editable, but absent from `q`, exact predicates, API and UI | No filter regression exists | No | Yes | Both backend and UI missing. |
+| S07-10 | User-accessible video-codec filter | PASS — IMPLEMENTED & AUTOMATED | Trimmed case-insensitive exact `video_codec` catalog/API predicate and Advanced Filters input | `FilterCompletionTests.test_video_codec_is_case_insensitive_and_exact`; live API composition test | No | No | Kept distinct from broad `q`. |
+| S07-11 | User-accessible bitrate filter | PASS — IMPLEMENTED & AUTOMATED | Inclusive overall-bitrate min/max controls and API values in kbps, converted to stored bps | `FilterCompletionTests.test_overall_bitrate_kbps_min_max_range_null_invalid_and_estimated`; live API composition test | No | No | NULL does not match; measured and estimated stored values use identical semantics. |
+| S07-12 | User-accessible movie-source filter | PASS — IMPLEMENTED & AUTOMATED | Trimmed case-insensitive exact `source` catalog/API predicate and Advanced Filters input | `FilterCompletionTests.test_movie_source_is_case_insensitive_exact_and_not_release_group`; live API composition test | No | No | Distinct from release group and subtitle source; broad `q` unchanged. |
 | S07-13 | User-accessible release/encoder-group filter | PASS — IMPLEMENTED & AUTOMATED | case-insensitive `groups/stats`; exact release-group query; Collections UI | P2A exact/case/collision test | No | No | YTS/yts collapse; YTSMX and QXR-Group remain distinct. |
 | S07-14 | User-accessible subtitle-language filter | PASS — IMPLEMENTED & AUTOMATED | advanced control; correlated subtitle `EXISTS` | V2 same-row filter test | No | No | — |
 | S07-15 | User-accessible subtitle-source/provider filter | PASS — IMPLEMENTED & AUTOMATED | advanced source control; correlated predicate | V2 same-row filter test | No | No | — |
 | S07-16 | User-accessible subtitle-translator filter | PASS — IMPLEMENTED & AUTOMATED | translator input; correlated predicate | V2 same-row filter test | No | No | — |
-| S07-17 | User-accessible subtitle-translation-quality filter | MISSING — V2.0 BLOCKER | Quality is editable, but no catalog/API/UI predicate exists | No filter regression exists | No | Yes | Must join the same correlated subtitle row. |
+| S07-17 | User-accessible subtitle-translation-quality filter | PASS — IMPLEMENTED & AUTOMATED | `subtitle_quality` is included in the existing correlated subtitle `EXISTS` predicate and exposed in Advanced Filters | `FilterCompletionTests.test_subtitle_quality_uses_same_correlated_subtitle_row`; live API composition test | No | No | Language, source, translator, and quality must match one subtitle row. |
 | S07-18 | User-accessible Missing filter | PASS — IMPLEMENTED & AUTOMATED | Missing chip/archive view; status predicate | catalog/browser tests | No | No | — |
 | S07-19 | User-accessible Offline filter | PASS — IMPLEMENTED & AUTOMATED | Offline chip/archive view; status predicate | catalog offline test | Yes, real drive | No | — |
-| S07-20 | Compound subtitle criteria apply to the same subtitle row | PASS — IMPLEMENTED & AUTOMATED | one correlated `EXISTS` containing language/source/translator predicates | `V2FeatureTests.test_advanced_filter_requires_same_subtitle_row` | No | No | New quality filter must preserve this invariant. |
+| S07-20 | Compound subtitle criteria apply to the same subtitle row | PASS — IMPLEMENTED & AUTOMATED | one correlated `EXISTS` containing language/source/translator/quality predicates | `V2FeatureTests.test_advanced_filter_requires_same_subtitle_row`; `FilterCompletionTests.test_subtitle_quality_uses_same_correlated_subtitle_row` | No | No | The quality filter preserves this invariant. |
 
 ### SCOPE-08 — Library integrity
 
@@ -334,32 +330,31 @@ Test-evidence shorthand used below resolves to these concrete automated checks:
 |---|---|---|---|---|---|---|---|
 | S21-01 | Group multiple editions under one card | DEFERRED — V2.1 | Not required by v2.0 scope | Not required | No | No | Remains deferred. |
 | S21-02 | Full dedicated Duplicate Manager | DEFERRED — V2.1 | Not required by v2.0 scope | Not required | No | No | Conservative relink safety is implemented independently. |
-| S21-03 | Advanced Recently Watched timeline | DEFERRED — V2.1 | Not required by v2.0 scope | Not required | No | No | Watched filtering itself is still a v2.0 blocker at S07-08. |
+| S21-03 | Advanced Recently Watched timeline | DEFERRED — V2.1 | Not required by v2.0 scope | Not required | No | No | Basic watched/unwatched filtering is complete at S07-08; only an advanced timeline remains deferred. |
 | S21-04 | Arbitrary merge of two non-empty libraries | DEFERRED — V2.1 | Migration deliberately refuses overwrite/merge | Refusal is tested | No | No | Backup restore is replacement, not merge. |
 | S21-05 | Major architecture rewrite | DEFERRED — V2.1 | Existing local-first architecture retained | Current regression suite | No | No | No rewrite is justified by this audit. |
 
-## Audit validation on the unchanged product baseline
+## Audit and filter-completion validation
 
-All commands below ran on Linux against the audited `origin/main` product files. The only branch change made by this audit is this document.
+All commands below ran on Linux. They do not replace the native-Windows acceptance gate.
 
 | Validation | Result |
 |---|---|
-| Full regression suite: `python -m unittest discover -s tests -v` | PASS — 148 tests |
-| Strict resources: `python -W error::ResourceWarning -m unittest discover -s tests -q` | PASS — 148 tests |
-| P2C real-server Chromium E2E: `python -m unittest -v tests.test_p2c_security.RealMovieServerBrowserTests` | PASS — 3 tests |
-| `python qa_runner.py` | PASS — 148 tests, compile step, and visual browser smoke |
-| Python compilation: `python -m compileall -q ...` | PASS |
+| Focused filter suite: `python -m unittest -v tests.test_v2_filters` | PASS — 9 tests |
 | JavaScript syntax: `node --check web/app.js` | PASS |
+| Full regression suite: `python -m unittest discover -s tests -v` | PASS — 158 tests, including the 3 P2C real-server Chromium tests |
+| Strict resources: `python -W error::ResourceWarning -m unittest discover -s tests -q` | PASS — 158 tests |
+| `python qa_runner.py` | PASS — 158 tests, Python compilation, and visual browser smoke |
 
 ## Classification totals
 
 The totals below are derived from the detailed matrix and must be updated together with it:
 
 - Total atomic requirements audited: **198**
-- PASS — IMPLEMENTED & AUTOMATED: **140**
+- PASS — IMPLEMENTED & AUTOMATED: **147**
 - PASS — IMPLEMENTED, WINDOWS ACCEPTANCE REQUIRED: **45**
-- PARTIAL — V2.0 BLOCKER: **1**
-- MISSING — V2.0 BLOCKER: **6**
+- PARTIAL — V2.0 BLOCKER: **0**
+- MISSING — V2.0 BLOCKER: **0**
 - REVIEW DECISION NEEDED: **0**
 - DEFERRED — V2.1: **5**
 - NOT APPLICABLE: **1**
