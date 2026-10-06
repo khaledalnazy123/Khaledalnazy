@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mv_gemini import GEMINI_CREDENTIAL_FILENAME
+from mv_tmdb import TMDB_CREDENTIAL_FILENAME
 from mv_version import ARTIFACT_VERSION,VERSION,WINDOWS_VERSION,read_version
 
 MAIN_LOCK_PACKAGES={
@@ -89,26 +91,65 @@ def load_binary_metadata(path:Path) -> list[dict]:
     data=json.loads(path.read_text(encoding='utf8'))
     binaries=data.get('binaries')
     if not isinstance(binaries,list):raise ValueError('Binary metadata has no binaries list')
+    if [item.get('name') for item in binaries]!=['ffprobe','ffmpeg']:raise ValueError('Binary metadata must describe ffprobe then ffmpeg exactly once')
     probe=next((item for item in binaries if item.get('name')=='ffprobe'),None)
     if not probe or not probe.get('present') or not SHA256_RE.fullmatch(str(probe.get('sha256',''))):
         raise ValueError('Binary metadata does not contain a valid required ffprobe record')
     for item in binaries:
+        expected_keys={'name','required','present','origin'}|({'identity','sha256','size'} if item.get('present') else set())
+        if set(item)!=expected_keys:raise ValueError('External binary provenance has missing or unexpected fields')
         if item.get('present') and not SHA256_RE.fullmatch(str(item.get('sha256',''))):raise ValueError('Invalid external binary SHA-256')
         if item.get('present') and (not item.get('identity') or not item.get('origin')):raise ValueError('External binary provenance is incomplete')
         if any(key in json.dumps(item).lower() for key in ('password','private key')):raise ValueError('Sensitive material in binary metadata')
     return binaries
 
 
-def release_metadata(binary_metadata:Path,signing_state:str) -> dict:
-    if signing_state not in ('SIGNED','UNSIGNED'):raise ValueError('Signing state must be SIGNED or UNSIGNED')
+def release_metadata(binary_metadata:Path,build_mode:str,application_signing_state:str,setup_signing_state:str|None=None) -> dict:
+    if build_mode not in ('portable','full'):raise ValueError('Build mode must be portable or full')
+    if application_signing_state not in ('SIGNED','UNSIGNED'):raise ValueError('Application signing state must be SIGNED or UNSIGNED')
+    if build_mode=='portable' and setup_signing_state is not None:raise ValueError('Portable metadata must not declare a Setup artifact')
+    if build_mode=='full' and setup_signing_state not in ('SIGNED','UNSIGNED'):raise ValueError('Full metadata requires a produced Setup signing state')
     version=version_payload()
-    return {
-        'format':'MovieVault Release Metadata 1','product':'MovieVault',**version,
-        'signing':{'state':signing_state,'artifacts':['MovieVault.exe',version['setup_name']]},
+    artifacts={'MovieVault.exe':{'type':'application','present':True,'signing_state':application_signing_state}}
+    payload={
+        'format':'MovieVault Release Metadata 2','product':'MovieVault',
+        'semantic_version':version['semantic_version'],'windows_numeric_version':version['windows_numeric_version'],
+        'artifact_version':version['artifact_version'],'portable_name':version['portable_name'],
+        'build_mode':build_mode,'artifacts':artifacts,
         'build_context':{'python':platform.python_version(),'implementation':platform.python_implementation(),'architecture':platform.machine()},
         'external_binaries':load_binary_metadata(binary_metadata),
         'windows_acceptance_tested':False,
     }
+    if build_mode=='full':
+        payload['setup_name']=version['setup_name']
+        artifacts[version['setup_name']]={'type':'installer','present':True,'signing_state':setup_signing_state}
+    return validate_release_metadata(payload)
+
+
+def validate_release_metadata(source:Path|dict) -> dict:
+    data=json.loads(source.read_text(encoding='utf8')) if isinstance(source,Path) else source
+    if not isinstance(data,dict) or data.get('format')!='MovieVault Release Metadata 2':raise ValueError('Invalid release metadata format')
+    mode=data.get('build_mode')
+    if mode not in ('portable','full'):raise ValueError('Release metadata has invalid build mode')
+    expected_keys={'format','product','semantic_version','windows_numeric_version','artifact_version','portable_name','build_mode','artifacts','build_context','external_binaries','windows_acceptance_tested'}
+    if mode=='full':expected_keys.add('setup_name')
+    if set(data)!=expected_keys:raise ValueError('Release metadata contains missing or unexpected fields')
+    if data.get('product')!='MovieVault' or data.get('semantic_version')!=VERSION or data.get('windows_numeric_version')!=WINDOWS_VERSION:raise ValueError('Release metadata version drift')
+    if data.get('artifact_version')!=ARTIFACT_VERSION or data.get('portable_name')!=version_payload()['portable_name']:raise ValueError('Release metadata artifact-name drift')
+    artifacts=data.get('artifacts')
+    expected_artifacts={'MovieVault.exe'} if mode=='portable' else {'MovieVault.exe',version_payload()['setup_name']}
+    if not isinstance(artifacts,dict) or set(artifacts)!=expected_artifacts:raise ValueError('Release metadata artifact set does not match build mode')
+    if mode=='full' and data.get('setup_name')!=version_payload()['setup_name']:raise ValueError('Release metadata Setup name drift')
+    for name,record in artifacts.items():
+        expected_type='application' if name=='MovieVault.exe' else 'installer'
+        if not isinstance(record,dict) or set(record)!={'type','present','signing_state'}:raise ValueError('Release artifact metadata has invalid shape')
+        if record.get('type')!=expected_type or record.get('present') is not True or record.get('signing_state') not in ('SIGNED','UNSIGNED'):
+            raise ValueError('Release artifact metadata has invalid state')
+    context=data.get('build_context')
+    if not isinstance(context,dict) or set(context)!={'python','implementation','architecture'}:raise ValueError('Release build context has invalid shape')
+    if data.get('windows_acceptance_tested') is not False:raise ValueError('Release metadata must not predeclare Windows acceptance')
+    if not isinstance(data.get('external_binaries'),list):raise ValueError('Release metadata external binaries have invalid shape')
+    return data
 
 
 def spdx_id(name:str) -> str:return 'SPDXRef-'+re.sub(r'[^A-Za-z0-9.-]+','-',name).strip('-')
@@ -124,9 +165,9 @@ def spdx_package(name:str,version:str,checksum:str|None=None,comment:str='') -> 
     return package
 
 
-def create_sbom(lock:Path,binary_metadata:Path,signing_state:str) -> dict:
+def create_sbom(lock:Path,binary_metadata:Path) -> dict:
     locked=parse_lock(lock,MAIN_LOCK_PACKAGES);binaries=load_binary_metadata(binary_metadata)
-    packages=[spdx_package('MovieVault',VERSION,comment=f'Windows signing state: {signing_state}'),spdx_package('Python',platform.python_version())]
+    packages=[spdx_package('MovieVault',VERSION),spdx_package('Python',platform.python_version())]
     packages.extend(spdx_package(record['name'],record['version'],record['sha256'],'Hash identifies the locked release distribution artifact.') for record in locked)
     for binary in binaries:
         if binary.get('present'):
@@ -175,7 +216,7 @@ def validate_sbom(path:Path) -> dict:
 def forbidden_package_path(relative:Path) -> str|None:
     lowered=[part.lower() for part in relative.parts];name=relative.name.lower()
     if any(part in {'tests','qa_reports','.git','user_data'} for part in lowered):return 'development or user-data directory'
-    if name in {'.env','movievault.sqlite','tmdb_credentials.bin','gemini_credentials.bin','restore_pending.zip'}:return 'credential, database, or restore data'
+    if name in {'.env','movievault.sqlite','tmdb_credentials.bin','gemini_credentials.bin',TMDB_CREDENTIAL_FILENAME,GEMINI_CREDENTIAL_FILENAME,'restore_pending.zip'}:return 'credential, database, or restore data'
     if relative.suffix.lower() in MEDIA_SUFFIXES:return 'movie or subtitle media'
     if relative.suffix.lower() in {'.db','.sqlite','.bak','.pfx','.p12','.pem','.key','.spec'}:return 'database, backup, private key, or build file'
     if name.startswith('requirements') or name in {'build_windows.cmd','build_windows.ps1','qa_runner.py'}:return 'development-only build input'
@@ -216,9 +257,7 @@ def verify_package(root:Path,manifest:Path,expect_ffmpeg:bool) -> dict:
     packaged_encoder=next((item for item in binary_metadata if item.get('name')=='ffmpeg'),None)
     if actual_ffmpeg and (not packaged_encoder or packaged_encoder.get('sha256')!=sha256_file(root/'vendor/ffmpeg.exe')):
         raise ValueError('Packaged ffmpeg does not match its provenance record')
-    metadata=json.loads((root/'release-metadata.json').read_text(encoding='utf8'))
-    if metadata.get('semantic_version')!=VERSION or metadata.get('windows_numeric_version')!=WINDOWS_VERSION:raise ValueError('Release metadata version drift')
-    if metadata.get('signing',{}).get('state') not in ('SIGNED','UNSIGNED'):raise ValueError('Release metadata lacks explicit signing state')
+    metadata=validate_release_metadata(root/'release-metadata.json')
     if metadata.get('external_binaries')!=binary_metadata:raise ValueError('Release metadata does not match binary provenance')
     for binary in binary_metadata:
         if not binary.get('present'):continue
@@ -226,14 +265,16 @@ def verify_package(root:Path,manifest:Path,expect_ffmpeg:bool) -> dict:
         if not any(check.get('algorithm')=='SHA256' and check.get('checksumValue')==binary['sha256'] for check in checks):
             raise ValueError(f'SBOM does not match {binary["name"]} provenance')
     entries=[{'path':path.relative_to(root).as_posix(),'size':path.stat().st_size,'sha256':sha256_file(path)} for path in files]
-    payload={'format':'MovieVault Release Manifest 1','product':'MovieVault','version':VERSION,'windows_numeric_version':WINDOWS_VERSION,'signing_state':metadata['signing']['state'],'ffmpeg_bundled':actual_ffmpeg,'files':entries}
+    payload={'format':'MovieVault Release Manifest 1','product':'MovieVault','version':VERSION,'windows_numeric_version':WINDOWS_VERSION,'build_mode':metadata['build_mode'],'artifacts':metadata['artifacts'],'ffmpeg_bundled':actual_ffmpeg,'files':entries}
     write_json(manifest,payload)
-    return {'files':len(entries),'ffmpeg_bundled':actual_ffmpeg,'signing_state':payload['signing_state']}
+    return {'files':len(entries),'ffmpeg_bundled':actual_ffmpeg,'build_mode':payload['build_mode'],'artifacts':payload['artifacts']}
 
 
 def validate_manifest(root:Path,manifest:Path) -> dict:
     data=json.loads(manifest.read_text(encoding='utf8'))
     if data.get('format')!='MovieVault Release Manifest 1' or data.get('version')!=VERSION:raise ValueError('Invalid release manifest metadata')
+    metadata=validate_release_metadata(root/'release-metadata.json')
+    if data.get('build_mode')!=metadata['build_mode'] or data.get('artifacts')!=metadata['artifacts']:raise ValueError('Release manifest artifact metadata mismatch')
     expected={path.relative_to(root).as_posix():path for path in package_files(root,manifest)}
     records=data.get('files')
     if not isinstance(records,list) or {record.get('path') for record in records}!=set(expected):raise ValueError('Release manifest file set mismatch')
@@ -250,8 +291,8 @@ def main(argv=None) -> int:
     command=sub.add_parser('pyinstaller-version');command.add_argument('--output',type=Path,required=True)
     command=sub.add_parser('validate-lock');command.add_argument('--lock',type=Path,required=True);command.add_argument('--bootstrap',action='store_true')
     command=sub.add_parser('binary-metadata');command.add_argument('--output',type=Path,required=True);command.add_argument('--ffprobe',type=Path,required=True);command.add_argument('--ffprobe-origin',required=True);command.add_argument('--ffmpeg',type=Path);command.add_argument('--ffmpeg-origin',default='not bundled')
-    command=sub.add_parser('release-metadata');command.add_argument('--output',type=Path,required=True);command.add_argument('--binary-metadata',type=Path,required=True);command.add_argument('--signing-state',choices=('SIGNED','UNSIGNED'),required=True)
-    command=sub.add_parser('sbom');command.add_argument('--output',type=Path,required=True);command.add_argument('--lock',type=Path,required=True);command.add_argument('--binary-metadata',type=Path,required=True);command.add_argument('--signing-state',choices=('SIGNED','UNSIGNED'),required=True)
+    command=sub.add_parser('release-metadata');command.add_argument('--output',type=Path,required=True);command.add_argument('--binary-metadata',type=Path,required=True);command.add_argument('--build-mode',choices=('portable','full'),required=True);command.add_argument('--application-signing-state',choices=('SIGNED','UNSIGNED'),required=True);command.add_argument('--setup-signing-state',choices=('SIGNED','UNSIGNED'))
+    command=sub.add_parser('sbom');command.add_argument('--output',type=Path,required=True);command.add_argument('--lock',type=Path,required=True);command.add_argument('--binary-metadata',type=Path,required=True)
     command=sub.add_parser('validate-sbom');command.add_argument('path',type=Path)
     command=sub.add_parser('verify-package');command.add_argument('--root',type=Path,required=True);command.add_argument('--manifest',type=Path,required=True);command.add_argument('--expect-ffmpeg',choices=('present','absent'),required=True)
     command=sub.add_parser('validate-manifest');command.add_argument('--root',type=Path,required=True);command.add_argument('--manifest',type=Path,required=True)
@@ -263,8 +304,10 @@ def main(argv=None) -> int:
         binaries=[binary_record(args.ffprobe,'ffprobe',True,args.ffprobe_origin)]
         binaries.append(binary_record(args.ffmpeg,'ffmpeg',False,args.ffmpeg_origin) if args.ffmpeg else {'name':'ffmpeg','required':False,'present':False,'origin':'not bundled'})
         write_json(args.output,{'format':'MovieVault External Binary Provenance 1','binaries':binaries});result={'output':args.output.name,'binaries':binaries}
-    elif args.command=='release-metadata':write_json(args.output,release_metadata(args.binary_metadata,args.signing_state));result={'output':args.output.name,'signing_state':args.signing_state}
-    elif args.command=='sbom':write_json(args.output,create_sbom(args.lock,args.binary_metadata,args.signing_state));result=validate_sbom(args.output)
+    elif args.command=='release-metadata':
+        metadata=release_metadata(args.binary_metadata,args.build_mode,args.application_signing_state,args.setup_signing_state)
+        write_json(args.output,metadata);result={'output':args.output.name,'build_mode':metadata['build_mode'],'artifacts':metadata['artifacts']}
+    elif args.command=='sbom':write_json(args.output,create_sbom(args.lock,args.binary_metadata));result=validate_sbom(args.output)
     elif args.command=='validate-sbom':result=validate_sbom(args.path)
     elif args.command=='verify-package':result=verify_package(args.root,args.manifest,args.expect_ffmpeg=='present')
     elif args.command=='validate-manifest':result=validate_manifest(args.root,args.manifest)

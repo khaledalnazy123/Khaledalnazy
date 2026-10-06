@@ -126,7 +126,6 @@ try {
   if ($signingConfigured -and $timestampUrl -notmatch '^https://') {
     throw 'MOVIEVAULT_SIGN_TIMESTAMP_URL must use HTTPS.'
   }
-  $signingState = 'UNSIGNED'
   $signTool = $null
   if ($signingConfigured) {
     if ($signCertificatePath -and -not (Test-Path $signCertificatePath -PathType Leaf)) {
@@ -134,7 +133,6 @@ try {
     }
     $signTool = Find-SignTool
     if (-not $signTool) { throw 'signtool.exe was not found for the requested signed build.' }
-    $signingState = 'SIGNED'
   } else {
     Write-Warning 'No signing credentials were configured. Artifacts will be explicitly marked UNSIGNED.'
   }
@@ -147,12 +145,42 @@ try {
   $packageRoot = (Resolve-Path 'dist\MovieVault').Path
   $application = Join-Path $packageRoot 'MovieVault.exe'
   if (-not (Test-Path $application -PathType Leaf)) { throw 'MovieVault.exe was not produced.' }
-  if ($signingConfigured) { Invoke-AuthenticodeSign $application }
+  if ($signingConfigured) {
+    Invoke-AuthenticodeSign $application
+    $applicationSigningState = 'SIGNED'
+  } else {
+    $applicationSigningState = 'UNSIGNED'
+  }
 
   Copy-Item 'build\external-binaries.json' (Join-Path $packageRoot 'external-binaries.json')
-  & py -3.12 release_tool.py release-metadata --output (Join-Path $packageRoot 'release-metadata.json') --binary-metadata 'build\external-binaries.json' --signing-state $signingState
+  $buildMode = 'portable'
+  $setupSigningState = $null
+  $setupPath = $null
+  if (-not $PortableOnly) {
+    $inno = @(
+      "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+      "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $inno) { throw 'Inno Setup 6 was not found; Setup.exe is a required output for a full release build.' }
+    $setupBaseName = [System.IO.Path]::GetFileNameWithoutExtension($version.setup_name)
+    & $inno "/DMyAppVersion=$($version.semantic_version)" "/DMyWindowsVersion=$($version.windows_numeric_version)" "/DMySetupBaseName=$setupBaseName" 'MovieVault.iss'
+    Assert-NativeSuccess 'Inno Setup compilation'
+    $setupPath = Join-Path 'release' $version.setup_name
+    if (-not (Test-Path $setupPath -PathType Leaf)) { throw 'Expected Setup.exe was not produced.' }
+    if ($signingConfigured) {
+      Invoke-AuthenticodeSign $setupPath
+      $setupSigningState = 'SIGNED'
+    } else {
+      $setupSigningState = 'UNSIGNED'
+    }
+    $buildMode = 'full'
+  }
+
+  $releaseMetadataArguments = @('release_tool.py', 'release-metadata', '--output', (Join-Path $packageRoot 'release-metadata.json'), '--binary-metadata', 'build\external-binaries.json', '--build-mode', $buildMode, '--application-signing-state', $applicationSigningState)
+  if ($buildMode -eq 'full') { $releaseMetadataArguments += @('--setup-signing-state', $setupSigningState) }
+  & py -3.12 @releaseMetadataArguments
   Assert-NativeSuccess 'Release metadata generation'
-  & py -3.12 release_tool.py sbom --output (Join-Path $packageRoot 'MovieVault.spdx.json') --lock requirements-windows.lock --binary-metadata 'build\external-binaries.json' --signing-state $signingState
+  & py -3.12 release_tool.py sbom --output (Join-Path $packageRoot 'MovieVault.spdx.json') --lock requirements-windows.lock --binary-metadata 'build\external-binaries.json'
   Assert-NativeSuccess 'SPDX SBOM generation'
   & py -3.12 release_tool.py validate-sbom (Join-Path $packageRoot 'MovieVault.spdx.json')
   Assert-NativeSuccess 'SPDX SBOM validation'
@@ -170,22 +198,8 @@ try {
   $portablePath = Join-Path 'release' $version.portable_name
   Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $portablePath -CompressionLevel Optimal
   if (-not (Test-Path $portablePath -PathType Leaf)) { throw 'Portable ZIP was not produced.' }
-  Write-Host "Portable package created: $portablePath ($signingState)" -ForegroundColor Green
-
-  if (-not $PortableOnly) {
-    $inno = @(
-      "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-      "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
-    ) | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
-    if (-not $inno) { throw 'Inno Setup 6 was not found; Setup.exe is a required output for a full release build.' }
-    $setupBaseName = [System.IO.Path]::GetFileNameWithoutExtension($version.setup_name)
-    & $inno "/DMyAppVersion=$($version.semantic_version)" "/DMyWindowsVersion=$($version.windows_numeric_version)" "/DMySetupBaseName=$setupBaseName" 'MovieVault.iss'
-    Assert-NativeSuccess 'Inno Setup compilation'
-    $setupPath = Join-Path 'release' $version.setup_name
-    if (-not (Test-Path $setupPath -PathType Leaf)) { throw 'Expected Setup.exe was not produced.' }
-    if ($signingConfigured) { Invoke-AuthenticodeSign $setupPath }
-    Write-Host "Installer created: $setupPath ($signingState)" -ForegroundColor Green
-  }
+  Write-Host "Portable package created: $portablePath ($applicationSigningState)" -ForegroundColor Green
+  if ($buildMode -eq 'full') { Write-Host "Installer created: $setupPath ($setupSigningState)" -ForegroundColor Green }
 
   Write-Host 'All requested build, verification, and packaging steps completed successfully.' -ForegroundColor Green
   exit 0

@@ -15,14 +15,18 @@ Implemented:
 - portable-package allow/deny verification plus a complete SHA-256 manifest;
 - genuine external Authenticode/timestamp configuration with mandatory
   verification, or explicit `UNSIGNED` metadata when credentials are absent;
+- per-artifact metadata that omits Setup from portable-only builds and records a
+  full-build Setup state only after creation and any required signature check;
+- explicit rejection of MovieVault's real `tmdb_credential.dpapi` and
+  `gemini_credential.dpapi` secret-storage filenames;
 - version-derived portable and setup names and Inno metadata;
 - focused Linux regression/fault tests for all of the above.
 
 Validation on Linux/Python 3.12.14:
 
-- dedicated P2B: **16/16 passed** with strict `ResourceWarning` handling;
-- full suite: **113/113 passed**;
-- strict full suite: **113/113 passed**;
+- dedicated P2B: **22/22 passed** with strict `ResourceWarning` handling;
+- full suite: **119/119 passed**;
+- strict full suite: **119/119 passed**;
 - compileall and JavaScript syntax: **passed**;
 - `qa_runner.py`: **PASS**, including Playwright visual smoke;
 - both lock structures and their actual hash-checked downloads: **passed** for

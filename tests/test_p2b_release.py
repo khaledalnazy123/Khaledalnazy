@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 import mv_core
+from mv_gemini import GEMINI_CREDENTIAL_FILENAME,GeminiCredentials
+from mv_tmdb import TMDB_CREDENTIAL_FILENAME,CredentialStore
 from mv_version import ARTIFACT_VERSION,VERSION,WINDOWS_VERSION,read_version,windows_numeric_version
 from release_tool import (
     BOOTSTRAP_LOCK_PACKAGES,
@@ -16,6 +18,7 @@ from release_tool import (
     release_metadata,
     sha256_file,
     validate_manifest,
+    validate_release_metadata,
     validate_sbom,
     verify_package,
     version_payload,
@@ -65,8 +68,8 @@ class P2BReleaseEngineeringTests(unittest.TestCase):
             (package/'vendor/ffmpeg.exe').chmod(0o755)
         (package/'vendor/ffprobe.exe').chmod(0o755)
         write_json(package/'external-binaries.json',json.loads(metadata.read_text(encoding='utf8')))
-        write_json(package/'release-metadata.json',release_metadata(metadata,'UNSIGNED'))
-        write_json(package/'MovieVault.spdx.json',create_sbom(ROOT/'requirements-windows.lock',metadata,'UNSIGNED'))
+        write_json(package/'release-metadata.json',release_metadata(metadata,'portable','UNSIGNED'))
+        write_json(package/'MovieVault.spdx.json',create_sbom(ROOT/'requirements-windows.lock',metadata))
         return package
 
     def test_authoritative_version_drives_runtime_and_artifact_names(self):
@@ -129,7 +132,7 @@ class P2BReleaseEngineeringTests(unittest.TestCase):
 
     def test_spdx_sbom_contains_runtime_build_and_external_components(self):
         metadata=self.binary_metadata(True)
-        path=self.base/'MovieVault.spdx.json';write_json(path,create_sbom(ROOT/'requirements-windows.lock',metadata,'UNSIGNED'))
+        path=self.base/'MovieVault.spdx.json';write_json(path,create_sbom(ROOT/'requirements-windows.lock',metadata))
         result=validate_sbom(path);self.assertGreaterEqual(result['packages'],20)
         data=json.loads(path.read_text(encoding='utf8'));names={item['name'] for item in data['packages']}
         self.assertTrue({'MovieVault','Python','pyinstaller','pywebview','Pillow','ffprobe','ffmpeg'}<=names)
@@ -137,7 +140,8 @@ class P2BReleaseEngineeringTests(unittest.TestCase):
     def test_package_verifier_emits_and_revalidates_complete_manifest(self):
         package=self.package(True);manifest=package/'release-manifest.json'
         result=verify_package(package,manifest,True)
-        self.assertGreaterEqual(result['files'],12);self.assertEqual(result['signing_state'],'UNSIGNED')
+        self.assertGreaterEqual(result['files'],12);self.assertEqual(result['build_mode'],'portable')
+        self.assertEqual(result['artifacts'],{'MovieVault.exe':{'type':'application','present':True,'signing_state':'UNSIGNED'}})
         records=json.loads(manifest.read_text(encoding='utf8'))['files']
         self.assertTrue(all(len(record['sha256'])==64 for record in records))
         self.assertEqual(validate_manifest(package,manifest)['files'],result['files'])
@@ -180,14 +184,66 @@ class P2BReleaseEngineeringTests(unittest.TestCase):
                 package=self.package(False);path=package/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'forbidden')
                 with self.assertRaisesRegex(ValueError,'Forbidden package member'):verify_package(package,package/'release-manifest.json',False)
 
+    def test_package_verifier_rejects_actual_dpapi_credential_filenames(self):
+        self.assertEqual(CredentialStore(self.base).path.name,TMDB_CREDENTIAL_FILENAME)
+        self.assertEqual(GeminiCredentials(self.base).path.name,GEMINI_CREDENTIAL_FILENAME)
+        for relative in (TMDB_CREDENTIAL_FILENAME,GEMINI_CREDENTIAL_FILENAME):
+            with self.subTest(relative=relative):
+                package=self.package(False);(package/relative).write_bytes(b'synthetic protected credential')
+                with self.assertRaisesRegex(ValueError,'Forbidden package member'):
+                    verify_package(package,package/'release-manifest.json',False)
+
+    def test_unsigned_portable_metadata_lists_only_application(self):
+        metadata=release_metadata(self.binary_metadata(False),'portable','UNSIGNED')
+        self.assertEqual(metadata['build_mode'],'portable')
+        self.assertNotIn('setup_name',metadata)
+        self.assertEqual(metadata['artifacts'],{'MovieVault.exe':{'type':'application','present':True,'signing_state':'UNSIGNED'}})
+        self.assertNotIn('MovieVault_Setup_',json.dumps(metadata))
+
+    def test_signed_portable_metadata_follows_application_signature_verification(self):
+        metadata=release_metadata(self.binary_metadata(False),'portable','SIGNED')
+        self.assertEqual(metadata['artifacts']['MovieVault.exe']['signing_state'],'SIGNED')
+        self.assertEqual(set(metadata['artifacts']),{'MovieVault.exe'})
+        build=(ROOT/'build_windows.ps1').read_text(encoding='utf8')
+        self.assertLess(build.index('Invoke-AuthenticodeSign $application'),build.index("$applicationSigningState = 'SIGNED'"))
+        self.assertLess(build.index("$applicationSigningState = 'SIGNED'"),build.index("'release-metadata'"))
+
+    def test_unsigned_full_metadata_lists_both_produced_artifacts(self):
+        metadata=release_metadata(self.binary_metadata(False),'full','UNSIGNED','UNSIGNED')
+        setup=version_payload()['setup_name']
+        self.assertEqual(metadata['build_mode'],'full')
+        self.assertEqual(metadata['artifacts']['MovieVault.exe']['signing_state'],'UNSIGNED')
+        self.assertEqual(metadata['artifacts'][setup],{'type':'installer','present':True,'signing_state':'UNSIGNED'})
+
+    def test_signed_full_metadata_is_emitted_only_after_setup_verification(self):
+        metadata=release_metadata(self.binary_metadata(False),'full','SIGNED','SIGNED')
+        setup=version_payload()['setup_name'];self.assertEqual(metadata['artifacts'][setup]['signing_state'],'SIGNED')
+        build=(ROOT/'build_windows.ps1').read_text(encoding='utf8')
+        compiled=build.index("Assert-NativeSuccess 'Inno Setup compilation'")
+        exists=build.index("if (-not (Test-Path $setupPath -PathType Leaf))")
+        signed=build.index('Invoke-AuthenticodeSign $setupPath')
+        recorded=build.index("$setupSigningState = 'SIGNED'")
+        emitted=build.index("'release-metadata'")
+        self.assertLess(compiled,exists);self.assertLess(exists,signed);self.assertLess(signed,recorded);self.assertLess(recorded,emitted)
+
+    def test_release_metadata_rejects_contradictory_or_secret_bearing_shapes(self):
+        binary=self.binary_metadata(False)
+        with self.assertRaises(ValueError):release_metadata(binary,'portable','UNSIGNED','UNSIGNED')
+        with self.assertRaises(ValueError):release_metadata(binary,'full','SIGNED')
+        metadata=release_metadata(binary,'portable','UNSIGNED');metadata['certificate_path']='secret.pfx'
+        with self.assertRaisesRegex(ValueError,'unexpected fields'):validate_release_metadata(metadata)
+        provenance=json.loads(binary.read_text(encoding='utf8'));provenance['binaries'][0]['certificate_path']='secret.pfx';write_json(binary,provenance)
+        with self.assertRaisesRegex(ValueError,'unexpected fields'):release_metadata(binary,'portable','UNSIGNED')
+
     def test_signing_is_real_or_explicitly_unsigned_without_embedded_secrets(self):
         text=(ROOT/'build_windows.ps1').read_text(encoding='utf8')
-        for marker in ('signtool.exe','MOVIEVAULT_SIGN_CERT_THUMBPRINT','MOVIEVAULT_SIGN_CERT_PATH','MOVIEVAULT_SIGN_TIMESTAMP_URL','verify /pa /all',"$signingState = 'UNSIGNED'"):
+        for marker in ('signtool.exe','MOVIEVAULT_SIGN_CERT_THUMBPRINT','MOVIEVAULT_SIGN_CERT_PATH','MOVIEVAULT_SIGN_TIMESTAMP_URL','verify /pa /all',"$applicationSigningState = 'UNSIGNED'","$setupSigningState = 'UNSIGNED'"):
             self.assertIn(marker,text)
         self.assertFalse(any(path.suffix.lower() in {'.pfx','.p12','.pem','.key'} for path in ROOT.rglob('*') if path.is_file()))
         metadata=self.binary_metadata(False)
-        self.assertEqual(release_metadata(metadata,'UNSIGNED')['signing']['state'],'UNSIGNED')
-        with self.assertRaises(ValueError):release_metadata(metadata,'pretend-signed')
+        payload=release_metadata(metadata,'portable','UNSIGNED')
+        self.assertNotIn('certificate',json.dumps(payload).lower());self.assertNotIn('password',json.dumps(payload).lower())
+        with self.assertRaises(ValueError):release_metadata(metadata,'portable','pretend-signed')
 
     def test_installer_requires_authoritative_version_defines(self):
         installer=(ROOT/'MovieVault.iss').read_text(encoding='utf8')

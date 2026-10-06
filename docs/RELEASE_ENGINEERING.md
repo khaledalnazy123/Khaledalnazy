@@ -59,6 +59,13 @@ Partial signing configuration is a hard failure. With no configuration, the
 build continues only as explicitly `UNSIGNED` in release metadata and the
 manifest; it never fabricates signing success.
 
+Signing metadata is per artifact. A portable-only build lists only the produced
+`MovieVault.exe`; it never lists a Setup artifact. A full build adds the
+versioned Setup filename only after Inno Setup has succeeded and the file exists.
+`SIGNED` is recorded only after the corresponding `signtool verify` call returns
+success. Certificate paths, thumbprints, passwords, and timestamp configuration
+are never copied into release metadata.
+
 ## Build and verification outputs
 
 Run `BUILD_WINDOWS.cmd` from CMD. It forwards options such as `-PortableOnly`
@@ -76,6 +83,11 @@ ffprobe, pywebview and Python.Runtime support, metadata, and SBOM. It rejects
 symlinks, credentials, private keys, databases, backups, media/subtitles, test
 trees, build inputs, and nested archives. Missing expected files or any hash
 change fails the build.
+
+Known credential rejection includes the application’s actual DPAPI filenames,
+`tmdb_credential.dpapi` and `gemini_credential.dpapi`, in addition to the generic
+secret/private-key/database rules. Release metadata and the manifest must carry
+the same exact build mode, artifact set, presence, and per-artifact signing state.
 
 The script treats dependency installation, tests, PyInstaller, signing,
 metadata/SBOM creation, package verification, archive creation, Inno Setup, and
